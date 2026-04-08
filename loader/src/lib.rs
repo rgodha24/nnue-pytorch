@@ -1,5 +1,8 @@
 use pyo3::prelude::*;
 
+pub mod feature_extraction;
+pub use sfbinpack::chess;
+
 /// Test function to verify the module is wired correctly
 #[pyfunction]
 fn hello() -> String {

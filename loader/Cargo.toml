@@ -9,10 +9,11 @@ rust-version = "1.75"
 
 [lib]
 name = "nnue_loader"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
+sfbinpack = "0.6.2"
 # TODO: Add dependencies as needed:
 # numpy = "0.24"
 # memmap2 = "0.9"
@@ -20,6 +21,9 @@ pyo3 = { version = "0.24", features = ["extension-module"] }
 # crossbeam-channel = "0.5"
 # thiserror = "1.0"
 # serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+libloading = "0.8"
 
 [profile.release]
 opt-level = 3
