@@ -1,10 +1,9 @@
 [project]
 name = "nnue-pytorch"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "nnue-loader @ file:./loader",
   "psutil",
   "asciimatics",
   "GPUtil",
@@ -21,3 +20,6 @@ dependencies = [
   "schedulefree",
   "cupy-cuda12x<14",
 ]
+
+[tool.setuptools]
+py-modules = []
