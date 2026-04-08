@@ -141,6 +141,16 @@ if(NOT UPPER_BUILD_TYPE STREQUAL "PGO_GENERATE")
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"
   )
+
+  # Test features target for ground truth verification
+  add_executable(test_features test_features.cpp training_data_loader.cpp)
+  target_link_libraries(test_features
+    PRIVATE Threads::Threads)
+
+  set_target_properties(test_features PROPERTIES
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN"
+  )
 endif()
 
 # ---- copy dataloader config ----
