@@ -1,0 +1,36 @@
+[package]
+name = "nnue-loader"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance NNUE training data loader written in Rust"
+license = "GPL-3.0"
+repository = "https://github.com/yourusername/nnue-pytorch"
+rust-version = "1.75"
+
+[lib]
+name = "nnue_loader"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+# TODO: Add dependencies as needed:
+# numpy = "0.24"
+# memmap2 = "0.9"
+# rayon = "1.8"
+# crossbeam-channel = "0.5"
+# thiserror = "1.0"
+# serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.profiling]
+inherits = "release"
+debug = true
