@@ -1,3 +1,4 @@
+import os
 import threading
 import queue
 
@@ -133,7 +134,7 @@ class TrainingDataProvider:
         self.destroy_stream(self.stream)
 
 
-class SparseBatchProvider(TrainingDataProvider):
+class CppSparseBatchProvider(TrainingDataProvider):
     def __init__(
         self,
         feature_set: str,
@@ -157,6 +158,163 @@ class SparseBatchProvider(TrainingDataProvider):
             config,
             ddp_config,
         )
+
+
+class RustSparseBatchProvider:
+    """Iterator that pulls batches from the Rust nnue_loader.BatchStream and
+    converts them to torch tensors. The Rust loader replaces the C++
+    SparseBatchProvider as the default training path."""
+
+    def __init__(
+        self,
+        feature_set: str,
+        filenames: list[str],
+        batch_size,
+        cyclic: bool = True,
+        num_workers: int = 1,
+        config: DataloaderSkipConfig = DataloaderSkipConfig(),
+        ddp_config: DataloaderDDPConfig = None,
+    ):
+        import nnue_loader
+
+        rank = 0
+        world_size = 1
+        if ddp_config is not None:
+            rank = int(ddp_config.rank)
+            world_size = int(ddp_config.world_size)
+
+        # Tuned defaults derived from sweeping the AMD Ryzen 9 9950X (16
+        # physical cores / 32 threads). Decoder threads are the bottleneck
+        # for skip-heavy workloads (filtering rejects ~99% of positions on
+        # the default UHO datasets), but feature extraction is also
+        # expensive enough that we want enough encoders to fully drain the
+        # decoded queue. The Rust loader will further refine the split based
+        # on `total_threads` if you don't specify both.
+        #
+        # On slurm/cgroup-restricted hosts, `os.cpu_count()` returns the
+        # host's full CPU count; `sched_getaffinity` returns the cgroup
+        # allocation, which is what we actually have to spend.
+        try:
+            cpu_count = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpu_count = os.cpu_count() or 8
+        # Reserve one thread for the consumer / pin-memory worker.
+        total_threads = max(1, cpu_count - 1)
+
+        # `num_workers` is the legacy C++ knob; if the user pinned it to
+        # something explicit we honour that as a hint, but the Rust loader
+        # uses dedicated decode/encode pools instead of one shared worker
+        # pool, so we don't map it 1:1.
+        if num_workers and num_workers > 1:
+            total_threads = max(total_threads, num_workers)
+
+        skip_heavy = (
+            config.filtered
+            or config.wld_filtered
+            or config.random_fen_skipping > 0
+            or config.early_fen_skipping >= 0
+            or (config.simple_eval_skipping is not None and config.simple_eval_skipping > 0)
+        )
+
+        if skip_heavy:
+            # ~60/40 decode/encode split. Decoders process ~10x more raw
+            # entries than encoders end up keeping, but feature extraction
+            # for Full_Threats+HalfKAv2_hm is expensive enough that the
+            # encoders also need significant cores.
+            decode_threads = max(1, (total_threads * 5) // 8)
+        else:
+            # Without skipping, encoders dominate.
+            decode_threads = max(1, total_threads // 4)
+        encode_threads = max(1, total_threads - decode_threads)
+
+        # Slab pool: at least one slab per encoder + a few buffered for the
+        # consumer. Bigger pools waste memory without throughput gains
+        # beyond ~1.5x encoders.
+        slab_count = max(8, encode_threads + max(4, encode_threads // 2))
+
+        self._stream = nnue_loader.BatchStream(
+            feature_set.replace("^", ""),
+            list(filenames),
+            batch_size,
+            decode_threads=decode_threads,
+            encode_threads=encode_threads,
+            slab_count=slab_count,
+            shuffle_buffer_entries=16384,
+            cyclic=cyclic,
+            filtered=config.filtered,
+            random_fen_skipping=int(config.random_fen_skipping),
+            wld_filtered=config.wld_filtered,
+            early_fen_skipping=int(config.early_fen_skipping),
+            simple_eval_skipping=int(config.simple_eval_skipping or 0),
+            param_index=int(config.param_index),
+            pc_y1=float(config.pc_y1),
+            pc_y2=float(config.pc_y2),
+            pc_y3=float(config.pc_y3),
+            rank=rank,
+            world_size=world_size,
+        )
+
+        # Reused all-ones buffer for feature_values. The CUDA kernel breaks on
+        # index == -1, so values at padded slots are never read; active slots
+        # always have value 1.0. A single shared buffer therefore works for
+        # every batch and eliminates per-batch allocation/pin cost.
+        self._ones_buffer: torch.Tensor | None = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        batch = self._stream.next_batch()
+        if batch is None:
+            raise StopIteration
+
+        us = torch.from_numpy(batch["is_white"])
+        them = 1.0 - us
+        white_indices = torch.from_numpy(batch["white"])
+        black_indices = torch.from_numpy(batch["black"])
+        outcome = torch.from_numpy(batch["outcome"])
+        score = torch.from_numpy(batch["score"])
+        psqt_indices = torch.from_numpy(batch["psqt_indices"])
+        layer_stack_indices = torch.from_numpy(batch["layer_stack_indices"])
+
+        rows, cols = white_indices.shape
+        if (
+            self._ones_buffer is None
+            or self._ones_buffer.shape[1] != cols
+            or self._ones_buffer.shape[0] < rows
+        ):
+            buf = torch.ones((rows, cols), dtype=torch.float32)
+            try:
+                buf = buf.pin_memory()
+            except RuntimeError:
+                # No CUDA available — fall back to a regular tensor.
+                pass
+            self._ones_buffer = buf
+        # Slicing the first dim of a contiguous tensor stays contiguous and
+        # preserves the pinned-memory flag, so the prefetch worker's
+        # pin_memory() call is a no-op for this tensor.
+        values = self._ones_buffer[:rows]
+
+        return (
+            us,
+            them,
+            white_indices,
+            values,
+            black_indices,
+            values,
+            outcome,
+            score,
+            psqt_indices,
+            layer_stack_indices,
+        )
+
+    def __del__(self):
+        if hasattr(self, "_stream"):
+            self._stream.close()
+
+
+# The Rust loader is now the default training data provider.
+SparseBatchProvider = RustSparseBatchProvider
 
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):

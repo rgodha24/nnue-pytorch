@@ -10,7 +10,8 @@ use pyo3::types::PyDict;
 
 use crate::feature_extraction::FeatureSet;
 use crate::pipeline::{
-    default_batch_slab_count, BatchPipeline, PipelineConfig, PipelineError, PooledBatch, SkipConfig,
+    default_batch_slab_count, BatchPipeline, PipelineConfig, PipelineError, PooledBatch,
+    SkipConfig, ThreadOverride,
 };
 
 #[pyclass(name = "BatchStream")]
@@ -31,7 +32,10 @@ impl PyBatchStream {
         filenames,
         batch_size,
         total_threads=None,
-        shuffle_buffer_entries=1_000_000,
+        decode_threads=None,
+        encode_threads=None,
+        slab_count=None,
+        shuffle_buffer_entries=16384,
         seed=None,
         cyclic=false,
         filtered=false,
@@ -52,6 +56,9 @@ impl PyBatchStream {
         filenames: Vec<String>,
         batch_size: usize,
         total_threads: Option<usize>,
+        decode_threads: Option<usize>,
+        encode_threads: Option<usize>,
+        slab_count: Option<usize>,
         shuffle_buffer_entries: usize,
         seed: Option<u64>,
         cyclic: bool,
@@ -77,7 +84,14 @@ impl PyBatchStream {
         if let Some(total_threads) = total_threads {
             config.total_threads = total_threads;
         }
-        config.slab_count = default_batch_slab_count();
+        if decode_threads.is_some() || encode_threads.is_some() {
+            config.thread_override = Some(ThreadOverride {
+                decode: decode_threads,
+                encode: encode_threads,
+            });
+        }
+        config.slab_count =
+            slab_count.unwrap_or_else(|| default_batch_slab_count(config.total_threads));
         config.shuffle_buffer_entries = shuffle_buffer_entries;
         config.seed = seed;
         config.cyclic = cyclic;

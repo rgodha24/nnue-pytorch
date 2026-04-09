@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -20,6 +20,8 @@ const VALUE_NONE: i16 = 32002;
 const MAX_SKIP_RATE: f64 = 10.0;
 const BINPACK_HEADER_SIZE: usize = 8;
 const BINPACK_MAX_CHUNK_SIZE: u32 = 100 * 1024 * 1024;
+const DECODER_COUNTER_FLUSH_INTERVAL: u64 = 4096;
+const ENCODER_COUNTER_FLUSH_INTERVAL: u64 = 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_ACCUMULATION_ENTRIES: usize = 1024;
 const WLD_MAX_PLY: usize = 240;
@@ -31,6 +33,7 @@ pub struct PipelineConfig {
     pub feature_set: FeatureSet,
     pub batch_size: usize,
     pub total_threads: usize,
+    pub thread_override: Option<ThreadOverride>,
     pub slab_count: usize,
     pub shuffle_buffer_entries: usize,
     pub accumulation_entries: usize,
@@ -39,6 +42,12 @@ pub struct PipelineConfig {
     pub seed: Option<u64>,
     pub rank: usize,
     pub world_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThreadOverride {
+    pub decode: Option<usize>,
+    pub encode: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,6 +129,23 @@ struct ChunkTask {
     size: u32,
 }
 
+struct ChunkScheduler {
+    tasks: Arc<[ChunkTask]>,
+    next_index: AtomicUsize,
+    cyclic: bool,
+}
+
+#[derive(Default)]
+struct DecoderWorkerCounters {
+    decoded_entries: u64,
+    skipped_entries: u64,
+}
+
+#[derive(Default)]
+struct EncoderWorkerCounters {
+    encoded_entries: u64,
+}
+
 #[derive(Default)]
 struct WldParams {
     a: f32,
@@ -150,8 +176,9 @@ impl PipelineConfig {
             feature_set,
             batch_size,
             total_threads,
-            slab_count: default_batch_slab_count(),
-            shuffle_buffer_entries: 1_000_000,
+            thread_override: None,
+            slab_count: default_batch_slab_count(total_threads),
+            shuffle_buffer_entries: 16_384,
             accumulation_entries: DEFAULT_ACCUMULATION_ENTRIES,
             cyclic: false,
             skip_config: SkipConfig::default(),
@@ -192,8 +219,33 @@ impl PipelineConfig {
         Ok(())
     }
 
-    pub fn thread_counts(&self) -> (usize, usize) {
-        default_thread_counts(self.total_threads)
+    fn skip_heavy(&self) -> bool {
+        self.skip_config.filtered
+            || self.skip_config.wld_filtered
+            || self.skip_config.random_fen_skipping > 0
+            || self.skip_config.early_fen_skipping >= 0
+            || self.skip_config.simple_eval_skipping > 0
+    }
+
+    pub fn thread_counts(&self, task_count: usize) -> (usize, usize) {
+        let (mut decode, mut encode) = default_thread_counts(
+            self.total_threads,
+            self.files.len(),
+            task_count,
+            self.skip_heavy(),
+        );
+        if let Some(ovr) = self.thread_override {
+            if let Some(d) = ovr.decode {
+                decode = d.max(1);
+            }
+            if let Some(e) = ovr.encode {
+                encode = e.max(1);
+            }
+        }
+        let available_tasks = task_count.max(1);
+        decode = decode.min(available_tasks).max(1);
+        encode = encode.max(1);
+        (decode, encode)
     }
 }
 
@@ -217,11 +269,14 @@ impl BatchPipeline {
     pub fn new(config: PipelineConfig) -> Result<Self, PipelineError> {
         config.validate()?;
 
-        let (decode_threads, encode_threads) = config.thread_counts();
         let scanned_chunks = scan_chunk_tasks(&config.files, config.rank, config.world_size)?;
         let scanned_chunk_count = scanned_chunks.len() as u64;
+        let (decode_threads, encode_threads) = config.thread_counts(scanned_chunks.len());
 
-        let decoded_capacity = decode_threads.saturating_mul(4).max(1);
+        // Decoded chunks queue: must be deep enough that decoders never block
+        // pushing while encoders are draining their slabs. Scale with the
+        // total worker count.
+        let decoded_capacity = (decode_threads + encode_threads).saturating_mul(4).max(16);
         let (decoded_tx, decoded_rx) = bounded::<Vec<TrainingDataEntry>>(decoded_capacity);
         let (ready_tx, ready_rx) = bounded::<HostBatchSlab>(config.slab_count);
         let (free_tx, free_rx) = bounded::<HostBatchSlab>(config.slab_count);
@@ -238,13 +293,12 @@ impl BatchPipeline {
         }
 
         let files = Arc::new(config.files.clone());
+        let chunk_scheduler = Arc::new(ChunkScheduler::new(scanned_chunks, config.cyclic));
         let mut workers = Vec::with_capacity(decode_threads + encode_threads);
 
-        for (thread_index, tasks) in distribute_chunk_tasks(&scanned_chunks, decode_threads)
-            .into_iter()
-            .enumerate()
-        {
+        for thread_index in 0..decode_threads {
             let files = Arc::clone(&files);
+            let chunk_scheduler = Arc::clone(&chunk_scheduler);
             let decoded_tx = decoded_tx.clone();
             let error_tx = error_tx.clone();
             let thread_config = config.clone();
@@ -253,7 +307,7 @@ impl BatchPipeline {
                 decoder_worker(
                     thread_index,
                     files,
-                    tasks,
+                    chunk_scheduler,
                     thread_config,
                     decoded_tx,
                     error_tx,
@@ -646,13 +700,13 @@ impl SkipDecider {
 fn decoder_worker(
     thread_index: usize,
     files: Arc<Vec<PathBuf>>,
-    tasks: Vec<ChunkTask>,
+    chunk_scheduler: Arc<ChunkScheduler>,
     config: PipelineConfig,
     decoded_tx: Sender<Vec<TrainingDataEntry>>,
     error_tx: Sender<String>,
     stats: Arc<PipelineCounters>,
 ) {
-    if tasks.is_empty() {
+    if chunk_scheduler.task_count() == 0 {
         return;
     }
 
@@ -662,16 +716,16 @@ fn decoder_worker(
     let mut shuffle_buffer = Vec::with_capacity(config.shuffle_buffer_entries.max(1));
     let mut accumulation = Vec::with_capacity(config.accumulation_entries);
     let mut chunk_buffer = Vec::new();
+    let mut counters = DecoderWorkerCounters::default();
     let mut file_handles = std::iter::repeat_with(|| None)
         .take(files.len())
         .collect::<Vec<Option<File>>>();
-    let mut task_index = 0usize;
 
-    loop {
-        let task = tasks[task_index];
+    while let Some(task) = chunk_scheduler.claim() {
         if let Err(error) =
             read_chunk_into_buffer(&mut file_handles, files.as_slice(), task, &mut chunk_buffer)
         {
+            flush_decoder_counters(&mut counters, &stats);
             report_error(
                 &error_tx,
                 format!(
@@ -686,18 +740,9 @@ fn decoder_worker(
         let cursor = Cursor::new(chunk_buffer.as_slice());
         let mut reader = match CompressedTrainingDataEntryReader::new(cursor) {
             Ok(reader) => reader,
-            Err(CompressedReaderError::EndOfFile) => {
-                task_index += 1;
-                if task_index == tasks.len() {
-                    if config.cyclic {
-                        task_index = 0;
-                    } else {
-                        break;
-                    }
-                }
-                continue;
-            }
+            Err(CompressedReaderError::EndOfFile) => continue,
             Err(error) => {
+                flush_decoder_counters(&mut counters, &stats);
                 report_error(
                     &error_tx,
                     format!(
@@ -712,10 +757,11 @@ fn decoder_worker(
 
         while reader.has_next() {
             let entry = reader.next();
-            stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+            counters.decoded_entries += 1;
 
             if skip_decider.should_skip(&entry, &mut rng) {
-                stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
+                counters.skipped_entries += 1;
+                flush_decoder_counters_if_needed(&mut counters, &stats);
                 continue;
             }
 
@@ -732,17 +778,11 @@ fn decoder_worker(
             if accumulation.len() >= config.accumulation_entries
                 && publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx).is_err()
             {
+                flush_decoder_counters(&mut counters, &stats);
                 return;
             }
-        }
 
-        task_index += 1;
-        if task_index == tasks.len() {
-            if config.cyclic {
-                task_index = 0;
-            } else {
-                break;
-            }
+            flush_decoder_counters_if_needed(&mut counters, &stats);
         }
     }
 
@@ -751,10 +791,12 @@ fn decoder_worker(
         if accumulation.len() >= config.accumulation_entries
             && publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx).is_err()
         {
+            flush_decoder_counters(&mut counters, &stats);
             return;
         }
     }
 
+    flush_decoder_counters(&mut counters, &stats);
     if !accumulation.is_empty() {
         let _ = publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx);
     }
@@ -800,23 +842,27 @@ fn encoder_worker(
     stats: Arc<PipelineCounters>,
 ) {
     let mut current_slab: Option<HostBatchSlab> = None;
+    let mut counters = EncoderWorkerCounters::default();
 
     while let Ok(entries) = decoded_rx.recv() {
         for entry in entries {
             if current_slab.is_none() {
                 current_slab = free_rx.recv().ok();
                 if current_slab.is_none() {
+                    flush_encoder_counters(&mut counters, &stats);
                     return;
                 }
             }
 
             let slab = current_slab.as_mut().unwrap();
             slab.push_entry(&entry, &feature_set);
-            stats.encoded_entries.fetch_add(1, Ordering::AcqRel);
+            counters.encoded_entries += 1;
+            flush_encoder_counters_if_needed(&mut counters, &stats);
 
             if slab.is_full() {
                 let ready_slab = current_slab.take().unwrap();
                 if ready_tx.send(ready_slab).is_err() {
+                    flush_encoder_counters(&mut counters, &stats);
                     return;
                 }
                 stats.produced_batches.fetch_add(1, Ordering::AcqRel);
@@ -824,6 +870,7 @@ fn encoder_worker(
         }
     }
 
+    flush_encoder_counters(&mut counters, &stats);
     if let Some(slab) = current_slab.take() {
         if slab.is_empty() {
             let _ = ready_tx; // keep sender alive until scope end
@@ -839,12 +886,73 @@ fn report_error(error_tx: &Sender<String>, message: String) {
     }
 }
 
-fn distribute_chunk_tasks(tasks: &[ChunkTask], decode_threads: usize) -> Vec<Vec<ChunkTask>> {
-    let mut per_thread = vec![Vec::new(); decode_threads];
-    for (index, task) in tasks.iter().copied().enumerate() {
-        per_thread[index % decode_threads].push(task);
+impl ChunkScheduler {
+    fn new(tasks: Vec<ChunkTask>, cyclic: bool) -> Self {
+        Self {
+            tasks: tasks.into(),
+            next_index: AtomicUsize::new(0),
+            cyclic,
+        }
     }
-    per_thread
+
+    fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn claim(&self) -> Option<ChunkTask> {
+        if self.tasks.is_empty() {
+            return None;
+        }
+
+        let index = self.next_index.fetch_add(1, Ordering::AcqRel);
+        if self.cyclic {
+            Some(self.tasks[index % self.tasks.len()])
+        } else {
+            self.tasks.get(index).copied()
+        }
+    }
+}
+
+fn flush_decoder_counters_if_needed(
+    counters: &mut DecoderWorkerCounters,
+    stats: &PipelineCounters,
+) {
+    if counters.decoded_entries >= DECODER_COUNTER_FLUSH_INTERVAL {
+        flush_decoder_counters(counters, stats);
+    }
+}
+
+fn flush_decoder_counters(counters: &mut DecoderWorkerCounters, stats: &PipelineCounters) {
+    if counters.decoded_entries > 0 {
+        stats
+            .decoded_entries
+            .fetch_add(counters.decoded_entries, Ordering::AcqRel);
+        counters.decoded_entries = 0;
+    }
+    if counters.skipped_entries > 0 {
+        stats
+            .skipped_entries
+            .fetch_add(counters.skipped_entries, Ordering::AcqRel);
+        counters.skipped_entries = 0;
+    }
+}
+
+fn flush_encoder_counters_if_needed(
+    counters: &mut EncoderWorkerCounters,
+    stats: &PipelineCounters,
+) {
+    if counters.encoded_entries >= ENCODER_COUNTER_FLUSH_INTERVAL {
+        flush_encoder_counters(counters, stats);
+    }
+}
+
+fn flush_encoder_counters(counters: &mut EncoderWorkerCounters, stats: &PipelineCounters) {
+    if counters.encoded_entries > 0 {
+        stats
+            .encoded_entries
+            .fetch_add(counters.encoded_entries, Ordering::AcqRel);
+        counters.encoded_entries = 0;
+    }
 }
 
 fn scan_chunk_tasks(
@@ -1056,18 +1164,48 @@ fn random_seed() -> u64 {
     rand::thread_rng().gen()
 }
 
-pub fn default_thread_counts(total_threads: usize) -> (usize, usize) {
+pub fn default_thread_counts(
+    total_threads: usize,
+    _file_count: usize,
+    task_count: usize,
+    skip_heavy: bool,
+) -> (usize, usize) {
     if total_threads <= 1 {
         return (1, 1);
     }
 
-    let decode_threads = (total_threads / 11).max(1);
-    let encode_threads = total_threads.saturating_sub(decode_threads).max(1);
+    let available_tasks = task_count.max(1);
+
+    // With the dynamic ChunkScheduler, all decoder threads pull from a shared
+    // queue, so we are not bound by file_count or any small cap. The split
+    // between decode/encode depends on whether we are skip-filtering hard
+    // (decoders do ~10x more work than encoders because most positions get
+    // dropped) or not (encoders dominate because feature extraction is the
+    // expensive part).
+    let (decode_threads, encode_threads) = if skip_heavy {
+        // Heavy skipping: decoders are the bottleneck. Give them the lion's
+        // share. ~3:1 split worked well empirically for ~90% skip rates with
+        // Full_Threats+HalfKAv2_hm feature extraction.
+        let decode_threads = ((total_threads * 3) / 4).max(1);
+        let encode_threads = total_threads.saturating_sub(decode_threads).max(1);
+        (decode_threads, encode_threads)
+    } else {
+        // No skipping: encoders are the bottleneck (feature extraction).
+        // Give them most of the cores; a handful of decoders is plenty.
+        let decode_threads = (total_threads / 4).max(1).min(8);
+        let encode_threads = total_threads.saturating_sub(decode_threads).max(1);
+        (decode_threads, encode_threads)
+    };
+
+    let decode_threads = decode_threads.min(available_tasks).max(1);
     (decode_threads, encode_threads)
 }
 
-pub fn default_batch_slab_count() -> usize {
-    4
+pub fn default_batch_slab_count(total_threads: usize) -> usize {
+    // Slabs are the in-flight batches an encoder can fill. We want at least
+    // one per encoder, plus a couple buffered for the consumer. With a 32-core
+    // box and ~8 encoders, this ends up around 12.
+    (total_threads / 2).clamp(8, 16)
 }
 
 #[cfg(test)]
