@@ -82,8 +82,6 @@ pub struct BatchPipeline {
     stop: Arc<AtomicBool>,
     ready_slabs: Arc<BlockingArrayQueue<HostBatchSlab>>,
     free_slabs: Arc<BlockingArrayQueue<HostBatchSlab>>,
-    ready_chunks: Arc<BlockingArrayQueue<HostBatchSlab>>,
-    free_chunks: Arc<BlockingArrayQueue<HostBatchSlab>>,
     position_queue: Arc<BlockingArrayQueue<TrainingDataEntry>>,
     error: Arc<Mutex<Option<PipelineError>>>,
     stats: Arc<PipelineCounters>,
@@ -111,8 +109,8 @@ pub struct HostBatchSlab {
     score: Vec<f32>,
     white: Vec<i32>,
     black: Vec<i32>,
-    psqt_indices: Vec<i32>,
-    layer_stack_indices: Vec<i32>,
+    psqt_indices: Vec<i64>,
+    layer_stack_indices: Vec<i64>,
 }
 
 struct BlockingArrayQueue<T> {
@@ -164,8 +162,6 @@ struct ThreadContext {
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<PipelineError>>>,
     position_queue: Arc<BlockingArrayQueue<TrainingDataEntry>>,
-    ready_chunks: Arc<BlockingArrayQueue<HostBatchSlab>>,
-    free_chunks: Arc<BlockingArrayQueue<HostBatchSlab>>,
     ready_slabs: Arc<BlockingArrayQueue<HostBatchSlab>>,
     free_slabs: Arc<BlockingArrayQueue<HostBatchSlab>>,
     stats: Arc<PipelineCounters>,
@@ -294,15 +290,8 @@ impl BatchPipeline {
         let error = Arc::new(Mutex::new(None));
         let stats = Arc::new(PipelineCounters::default());
         let position_queue = Arc::new(BlockingArrayQueue::new(config.position_queue_capacity));
-        let ready_chunks = Arc::new(BlockingArrayQueue::new(config.chunk_queue_capacity));
-        let free_chunks = Arc::new(BlockingArrayQueue::new(config.chunk_queue_capacity));
         let ready_slabs = Arc::new(BlockingArrayQueue::new(config.slab_count));
         let free_slabs = Arc::new(BlockingArrayQueue::new(config.slab_count));
-
-        for _ in 0..config.chunk_queue_capacity {
-            let chunk = HostBatchSlab::new(config.encoder_chunk_size, &config.feature_set);
-            let _ = free_chunks.push_blocking(chunk, &stop);
-        }
 
         for _ in 0..config.slab_count {
             let slab = HostBatchSlab::new(config.batch_size, &config.feature_set);
@@ -313,8 +302,6 @@ impl BatchPipeline {
             stop: Arc::clone(&stop),
             error: Arc::clone(&error),
             position_queue: Arc::clone(&position_queue),
-            ready_chunks: Arc::clone(&ready_chunks),
-            free_chunks: Arc::clone(&free_chunks),
             ready_slabs: Arc::clone(&ready_slabs),
             free_slabs: Arc::clone(&free_slabs),
             stats: Arc::clone(&stats),
@@ -335,7 +322,7 @@ impl BatchPipeline {
             .map(|scheduler| preferred_decoder_workers(&config, scheduler.task_count()))
             .unwrap_or(config.files.len());
 
-        let mut workers = Vec::with_capacity(decoder_workers + config.encoding_threads + 1);
+        let mut workers = Vec::with_capacity(decoder_workers + config.encoding_threads);
         let active_decoders = Arc::new(AtomicUsize::new(decoder_workers));
         let active_encoders = Arc::new(AtomicUsize::new(config.encoding_threads));
 
@@ -377,19 +364,10 @@ impl BatchPipeline {
                 encoder_worker(index, config, context, active_encoders)
             }));
         }
-
-        {
-            let context = context.clone();
-            let config = config.clone();
-            workers.push(thread::spawn(move || assembler_worker(config, context)));
-        }
-
         Ok(Self {
             stop,
             ready_slabs,
             free_slabs,
-            ready_chunks,
-            free_chunks,
             position_queue,
             error,
             stats,
@@ -421,8 +399,8 @@ impl BatchPipeline {
             skipped_entries: self.stats.skipped_entries.load(Ordering::Acquire),
             produced_batches: self.stats.produced_batches.load(Ordering::Acquire),
             position_queue_len: self.position_queue.len(),
-            ready_chunks_len: self.ready_chunks.len(),
-            free_chunks_len: self.free_chunks.len(),
+            ready_chunks_len: 0,
+            free_chunks_len: 0,
             ready_slabs_len: self.ready_slabs.len(),
             free_slabs_len: self.free_slabs.len(),
         }
@@ -433,8 +411,6 @@ impl Drop for BatchPipeline {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.position_queue.close();
-        self.ready_chunks.close();
-        self.free_chunks.close();
         self.ready_slabs.close();
         self.free_slabs.close();
 
@@ -537,11 +513,11 @@ impl HostBatchSlab {
         &self.score[..self.size]
     }
 
-    pub fn psqt_indices_slice(&self) -> &[i32] {
+    pub fn psqt_indices_slice(&self) -> &[i64] {
         &self.psqt_indices[..self.size]
     }
 
-    pub fn layer_stack_indices_slice(&self) -> &[i32] {
+    pub fn layer_stack_indices_slice(&self) -> &[i64] {
         &self.layer_stack_indices[..self.size]
     }
 
@@ -579,8 +555,8 @@ impl HostBatchSlab {
             black_values: feature_values_from_indices(&black),
             white,
             black,
-            psqt_indices: self.psqt_indices[row],
-            layer_stack_indices: self.layer_stack_indices[row],
+            psqt_indices: self.psqt_indices[row] as i32,
+            layer_stack_indices: self.layer_stack_indices[row] as i32,
         }
     }
 
@@ -599,53 +575,6 @@ impl HostBatchSlab {
         self.size += 1;
     }
 
-    fn remaining_capacity(&self) -> usize {
-        self.capacity - self.size
-    }
-
-    fn append_rows_from(&mut self, src: &HostBatchSlab, src_row: usize) -> usize {
-        let rows = self
-            .remaining_capacity()
-            .min(src.len().saturating_sub(src_row));
-        if rows == 0 {
-            return 0;
-        }
-
-        let dst_row = self.size;
-        let dst_end = dst_row + rows;
-        let src_end = src_row + rows;
-        let flat_width = self.max_active_features;
-        let dst_flat_start = dst_row * flat_width;
-        let dst_flat_end = dst_end * flat_width;
-        let src_flat_start = src_row * flat_width;
-        let src_flat_end = src_end * flat_width;
-
-        self.white[dst_flat_start..dst_flat_end]
-            .copy_from_slice(&src.white[src_flat_start..src_flat_end]);
-        self.black[dst_flat_start..dst_flat_end]
-            .copy_from_slice(&src.black[src_flat_start..src_flat_end]);
-        self.white_counts[dst_row..dst_end].copy_from_slice(&src.white_counts[src_row..src_end]);
-        self.black_counts[dst_row..dst_end].copy_from_slice(&src.black_counts[src_row..src_end]);
-        self.is_white[dst_row..dst_end].copy_from_slice(&src.is_white[src_row..src_end]);
-        self.outcome[dst_row..dst_end].copy_from_slice(&src.outcome[src_row..src_end]);
-        self.score[dst_row..dst_end].copy_from_slice(&src.score[src_row..src_end]);
-        self.psqt_indices[dst_row..dst_end].copy_from_slice(&src.psqt_indices[src_row..src_end]);
-        self.layer_stack_indices[dst_row..dst_end]
-            .copy_from_slice(&src.layer_stack_indices[src_row..src_end]);
-
-        self.num_active_white_features += src.white_counts[src_row..src_end]
-            .iter()
-            .map(|&count| count as usize)
-            .sum::<usize>();
-        self.num_active_black_features += src.black_counts[src_row..src_end]
-            .iter()
-            .map(|&count| count as usize)
-            .sum::<usize>();
-        self.size = dst_end;
-
-        rows
-    }
-
     fn reset(&mut self) {
         self.size = 0;
         self.num_active_white_features = 0;
@@ -658,8 +587,8 @@ impl HostBatchSlab {
         self.is_white[row] = metadata.is_white;
         self.outcome[row] = metadata.outcome;
         self.score[row] = metadata.score;
-        self.psqt_indices[row] = metadata.psqt_indices;
-        self.layer_stack_indices[row] = metadata.layer_stack_indices;
+        self.psqt_indices[row] = metadata.psqt_indices as i64;
+        self.layer_stack_indices[row] = metadata.layer_stack_indices as i64;
         self.num_active_white_features += metadata.white_count;
         self.num_active_black_features += metadata.black_count;
     }
@@ -1196,86 +1125,31 @@ fn encoder_worker(
     context: ThreadContext,
     active_encoders: Arc<AtomicUsize>,
 ) {
-    let mut current_chunk: Option<HostBatchSlab> = None;
+    let mut current_slab: Option<HostBatchSlab> = None;
     let mut counters = EncoderWorkerCounters::default();
 
     while let Some(entry) = context.position_queue.pop_blocking(&context.stop) {
-        if current_chunk.is_none() {
-            current_chunk = context.free_chunks.pop_blocking(&context.stop);
-            if current_chunk.is_none() {
+        if current_slab.is_none() {
+            current_slab = context.free_slabs.pop_blocking(&context.stop);
+            if current_slab.is_none() {
                 break;
             }
         }
 
-        let chunk = current_chunk.as_mut().unwrap();
-        chunk.push_entry(&entry, &config.feature_set);
+        let slab = current_slab.as_mut().unwrap();
+        slab.push_entry(&entry, &config.feature_set);
         counters.encoded_entries += 1;
         flush_encoder_counters_if_needed(&mut counters, &context);
 
-        if chunk.is_full() {
-            let full_chunk = current_chunk.take().unwrap();
-            if context
-                .ready_chunks
-                .push_blocking(full_chunk, &context.stop)
-                .is_err()
-            {
+        if slab.is_full() {
+            let full_slab = current_slab.take().unwrap();
+            if publish_ready_slab(full_slab, &context).is_err() {
                 break;
             }
         }
     }
 
     flush_encoder_counters(&mut counters, &context);
-    if let Some(chunk) = current_chunk.take() {
-        if chunk.is_empty() {
-            let _ = context.free_chunks.push_blocking(chunk, &context.stop);
-        } else {
-            let _ = context.ready_chunks.push_blocking(chunk, &context.stop);
-        }
-    }
-
-    if active_encoders.fetch_sub(1, Ordering::AcqRel) == 1 {
-        context.ready_chunks.close();
-    }
-}
-
-fn assembler_worker(_config: PipelineConfig, context: ThreadContext) {
-    let mut current_slab: Option<HostBatchSlab> = None;
-
-    while let Some(mut chunk) = context.ready_chunks.pop_blocking(&context.stop) {
-        let mut chunk_row = 0;
-
-        while chunk_row < chunk.len() {
-            if current_slab.is_none() {
-                current_slab = context.free_slabs.pop_blocking(&context.stop);
-                if current_slab.is_none() {
-                    context.ready_slabs.close();
-                    return;
-                }
-            }
-
-            let slab = current_slab.as_mut().unwrap();
-            chunk_row += slab.append_rows_from(&chunk, chunk_row);
-
-            if slab.is_full() {
-                let full_slab = current_slab.take().unwrap();
-                if publish_ready_slab(full_slab, &context).is_err() {
-                    context.ready_slabs.close();
-                    return;
-                }
-            }
-        }
-
-        chunk.reset();
-        if context
-            .free_chunks
-            .push_blocking(chunk, &context.stop)
-            .is_err()
-        {
-            context.ready_slabs.close();
-            return;
-        }
-    }
-
     if let Some(slab) = current_slab.take() {
         if slab.is_empty() {
             let _ = context.free_slabs.push_blocking(slab, &context.stop);
@@ -1284,7 +1158,9 @@ fn assembler_worker(_config: PipelineConfig, context: ThreadContext) {
         }
     }
 
-    context.ready_slabs.close();
+    if active_encoders.fetch_sub(1, Ordering::AcqRel) == 1 {
+        context.ready_slabs.close();
+    }
 }
 
 fn publish_ready_slab(slab: HostBatchSlab, context: &ThreadContext) -> Result<(), HostBatchSlab> {

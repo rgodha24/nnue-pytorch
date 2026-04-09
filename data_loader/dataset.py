@@ -1,5 +1,6 @@
 import queue
 import threading
+import os
 from collections.abc import Iterator
 from typing import cast
 
@@ -99,7 +100,7 @@ class RustSparseBatchProvider:
         )
 
         if skip_heavy:
-            encoding_threads = max(1, min(num_workers, 4))
+            encoding_threads = max(1, min(max(num_workers, 4), os.cpu_count() or 1, 4))
         else:
             encoding_threads = max(1, num_workers)
 

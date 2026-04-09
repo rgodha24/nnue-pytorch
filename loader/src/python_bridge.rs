@@ -22,8 +22,6 @@ pub struct PyBatchStream {
 #[pyclass]
 struct PyBatchOwner {
     batch: PooledBatch,
-    psqt_indices_i64: Vec<i64>,
-    layer_stack_indices_i64: Vec<i64>,
 }
 
 #[pymethods]
@@ -334,8 +332,8 @@ fn batch_to_pydict<'py>(py: Python<'py>, batch: PooledBatch) -> PyResult<Bound<'
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let black_view = ArrayView2::from_shape((rows, cols), batch.black_flat_slice())
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    let psqt_indices_view = ArrayView1::from(owner_ref.psqt_indices_i64.as_slice());
-    let layer_stack_indices_view = ArrayView1::from(owner_ref.layer_stack_indices_i64.as_slice());
+    let psqt_indices_view = ArrayView1::from(batch.psqt_indices_slice());
+    let layer_stack_indices_view = ArrayView1::from(batch.layer_stack_indices_slice());
 
     let is_white =
         unsafe { PyArray2::borrow_from_array(&is_white_view, owner_bound.clone().into_any()) };
@@ -378,21 +376,6 @@ fn to_py_runtime_error(error: PipelineError) -> PyErr {
 
 impl PyBatchOwner {
     fn new(batch: PooledBatch) -> Self {
-        let psqt_indices_i64 = batch
-            .psqt_indices_slice()
-            .iter()
-            .map(|&value| value as i64)
-            .collect();
-        let layer_stack_indices_i64 = batch
-            .layer_stack_indices_slice()
-            .iter()
-            .map(|&value| value as i64)
-            .collect();
-
-        Self {
-            batch,
-            psqt_indices_i64,
-            layer_stack_indices_i64,
-        }
+        Self { batch }
     }
 }
