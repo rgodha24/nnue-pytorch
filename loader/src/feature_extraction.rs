@@ -420,13 +420,12 @@ fn fill_row_from_position(
     debug_assert_eq!(black.len(), feature_set.max_active_features());
     debug_assert_eq!(black_values.len(), feature_set.max_active_features());
 
-    white.fill(-1);
-    white_values.fill(0.0);
-    black.fill(-1);
-    black_values.fill(0.0);
-
     let white_count = feature_set.fill_features_sparse(pos, Color::White, white, white_values);
     let black_count = feature_set.fill_features_sparse(pos, Color::Black, black, black_values);
+    white[white_count..].fill(-1);
+    white_values[white_count..].fill(0.0);
+    black[black_count..].fill(-1);
+    black_values[black_count..].fill(0.0);
     let piece_count = pos.occupied().count() as i32;
 
     RowMetadata {
@@ -455,11 +454,10 @@ fn fill_row_from_position_without_values(
     debug_assert_eq!(white.len(), feature_set.max_active_features());
     debug_assert_eq!(black.len(), feature_set.max_active_features());
 
-    white.fill(-1);
-    black.fill(-1);
-
     let white_count = feature_set.fill_feature_indices_sparse(pos, Color::White, white);
     let black_count = feature_set.fill_feature_indices_sparse(pos, Color::Black, black);
+    white[white_count..].fill(-1);
+    black[black_count..].fill(-1);
     let piece_count = pos.occupied().count() as i32;
 
     RowMetadata {
