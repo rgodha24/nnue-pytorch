@@ -1,3 +1,3 @@
-from nnue_loader._internal import hello
+from nnue_loader._internal import BatchStream
 
-__all__ = ["hello"]
+__all__ = ["BatchStream"]
