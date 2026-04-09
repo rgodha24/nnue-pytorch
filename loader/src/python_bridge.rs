@@ -2,18 +2,25 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Mutex;
 
-use numpy::ndarray::{Array1, Array2};
-use numpy::IntoPyArray;
+use numpy::ndarray::{ArrayView1, ArrayView2};
+use numpy::{PyArray1, PyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::feature_extraction::FeatureSet;
-use crate::pipeline::{BatchPipeline, HostBatchSlab, PipelineConfig, PipelineError, SkipConfig};
+use crate::pipeline::{BatchPipeline, PipelineConfig, PipelineError, PooledBatch, SkipConfig};
 
 #[pyclass(name = "BatchStream")]
 pub struct PyBatchStream {
     pipeline: Mutex<Option<BatchPipeline>>,
+}
+
+#[pyclass(unsendable)]
+struct PyBatchOwner {
+    batch: PooledBatch,
+    psqt_indices_i64: Vec<i64>,
+    layer_stack_indices_i64: Vec<i64>,
 }
 
 #[pymethods]
@@ -100,7 +107,7 @@ impl PyBatchStream {
         });
 
         match maybe_batch {
-            Ok(Some(batch)) => Ok(Some(batch_to_pydict(py, &batch)?)),
+            Ok(Some(batch)) => Ok(Some(batch_to_pydict(py, batch)?)),
             Ok(None) => Ok(None),
             Err(error) => Err(to_py_runtime_error(error)),
         }
@@ -300,22 +307,39 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn batch_to_pydict<'py>(py: Python<'py>, batch: &HostBatchSlab) -> PyResult<Bound<'py, PyDict>> {
+fn batch_to_pydict<'py>(py: Python<'py>, batch: PooledBatch) -> PyResult<Bound<'py, PyDict>> {
+    let owner = Py::new(py, PyBatchOwner::new(batch))?;
+    let owner_bound = owner.bind(py);
+    let owner_ref = owner_bound.borrow();
+    let batch = owner_ref.batch.slab();
     let rows = batch.len();
     let cols = batch.max_active_features();
 
-    let is_white = Array1::from_vec(batch.is_white_slice().to_vec()).into_pyarray(py);
-    let outcome = Array1::from_vec(batch.outcome_slice().to_vec()).into_pyarray(py);
-    let score = Array1::from_vec(batch.score_slice().to_vec()).into_pyarray(py);
-    let white = Array2::from_shape_vec((rows, cols), batch.white_flat_slice().to_vec())
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-        .into_pyarray(py);
-    let black = Array2::from_shape_vec((rows, cols), batch.black_flat_slice().to_vec())
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-        .into_pyarray(py);
-    let psqt_indices = Array1::from_vec(batch.psqt_indices_slice().to_vec()).into_pyarray(py);
-    let layer_stack_indices =
-        Array1::from_vec(batch.layer_stack_indices_slice().to_vec()).into_pyarray(py);
+    let is_white_view = ArrayView2::from_shape((rows, 1), batch.is_white_slice())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let outcome_view = ArrayView2::from_shape((rows, 1), batch.outcome_slice())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let score_view = ArrayView2::from_shape((rows, 1), batch.score_slice())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let white_view = ArrayView2::from_shape((rows, cols), batch.white_flat_slice())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let black_view = ArrayView2::from_shape((rows, cols), batch.black_flat_slice())
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let psqt_indices_view = ArrayView1::from(owner_ref.psqt_indices_i64.as_slice());
+    let layer_stack_indices_view = ArrayView1::from(owner_ref.layer_stack_indices_i64.as_slice());
+
+    let is_white =
+        unsafe { PyArray2::borrow_from_array(&is_white_view, owner_bound.clone().into_any()) };
+    let outcome =
+        unsafe { PyArray2::borrow_from_array(&outcome_view, owner_bound.clone().into_any()) };
+    let score = unsafe { PyArray2::borrow_from_array(&score_view, owner_bound.clone().into_any()) };
+    let white = unsafe { PyArray2::borrow_from_array(&white_view, owner_bound.clone().into_any()) };
+    let black = unsafe { PyArray2::borrow_from_array(&black_view, owner_bound.clone().into_any()) };
+    let psqt_indices =
+        unsafe { PyArray1::borrow_from_array(&psqt_indices_view, owner_bound.clone().into_any()) };
+    let layer_stack_indices = unsafe {
+        PyArray1::borrow_from_array(&layer_stack_indices_view, owner_bound.clone().into_any())
+    };
 
     let dict = PyDict::new(py);
     dict.set_item("num_inputs", batch.num_inputs())?;
@@ -341,4 +365,25 @@ fn batch_to_pydict<'py>(py: Python<'py>, batch: &HostBatchSlab) -> PyResult<Boun
 
 fn to_py_runtime_error(error: PipelineError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
+}
+
+impl PyBatchOwner {
+    fn new(batch: PooledBatch) -> Self {
+        let psqt_indices_i64 = batch
+            .psqt_indices_slice()
+            .iter()
+            .map(|&value| value as i64)
+            .collect();
+        let layer_stack_indices_i64 = batch
+            .layer_stack_indices_slice()
+            .iter()
+            .map(|&value| value as i64)
+            .collect();
+
+        Self {
+            batch,
+            psqt_indices_i64,
+            layer_stack_indices_i64,
+        }
+    }
 }
