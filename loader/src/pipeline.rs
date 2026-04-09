@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -6,7 +7,6 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_queue::ArrayQueue;
 use rand::rngs::SmallRng;
-use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use sfbinpack::chess::{color::Color, piece::Piece, piecetype::PieceType};
 use sfbinpack::{CompressedReaderError, CompressedTrainingDataEntryReader, TrainingDataEntry};
@@ -552,16 +552,6 @@ impl<T> BlockingArrayQueue<T> {
             }
         }
     }
-
-    fn wait_for_len_at_most(&self, max_len: usize, stop: &AtomicBool) {
-        let mut guard = self.wait_mutex.lock().unwrap();
-        while self.queue.len() > max_len
-            && !self.closed.load(Ordering::Acquire)
-            && !stop.load(Ordering::Acquire)
-        {
-            guard = self.wait_cv.wait(guard).unwrap();
-        }
-    }
 }
 
 impl Default for PipelineCounters {
@@ -696,7 +686,8 @@ fn decoder_worker(
 ) {
     let base_seed = config.seed.unwrap_or_else(random_seed);
     let mut rng = SmallRng::seed_from_u64(base_seed ^ worker_index as u64);
-    let mut local_entries = Vec::with_capacity(config.shuffle_buffer_entries);
+    let mut shuffled_entries = Vec::with_capacity(config.shuffle_buffer_entries);
+    let mut ordered_entries = VecDeque::with_capacity(config.shuffle_buffer_entries.min(1024));
 
     loop {
         if context.stop.load(Ordering::Acquire) {
@@ -735,39 +726,17 @@ fn decoder_worker(
         };
 
         loop {
-            local_entries.clear();
-
-            while local_entries.len() < config.shuffle_buffer_entries && reader.has_next() {
-                local_entries.push(reader.next());
-            }
-
-            if local_entries.is_empty() {
-                break;
-            }
-
             if config.shuffle_chunks {
-                local_entries.shuffle(&mut rng);
-            }
-
-            if context.position_queue.len() >= config.position_queue_high_watermark {
-                context
-                    .position_queue
-                    .wait_for_len_at_most(config.position_queue_low_watermark, &context.stop);
-            }
-
-            for entry in local_entries.drain(..) {
-                if context
-                    .position_queue
-                    .push_blocking(entry, &context.stop)
-                    .is_err()
-                {
+                if !push_shuffled_entries(
+                    &mut reader,
+                    &mut shuffled_entries,
+                    &mut rng,
+                    &config,
+                    &context,
+                ) {
                     break;
                 }
-
-                context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
-            }
-
-            if !reader.has_next() || context.stop.load(Ordering::Acquire) {
+            } else if !push_ordered_entries(&mut reader, &mut ordered_entries, &context) {
                 break;
             }
         }
@@ -780,6 +749,79 @@ fn decoder_worker(
     if active_decoders.fetch_sub(1, Ordering::AcqRel) == 1 {
         context.position_queue.close();
     }
+}
+
+fn push_shuffled_entries(
+    reader: &mut CompressedTrainingDataEntryReader<File>,
+    buffer: &mut Vec<TrainingDataEntry>,
+    rng: &mut SmallRng,
+    config: &PipelineConfig,
+    context: &ThreadContext,
+) -> bool {
+    fill_shuffle_buffer(reader, buffer, config.shuffle_buffer_entries);
+    while let Some(entry) = pop_shuffled_entry(buffer, rng) {
+        if context
+            .position_queue
+            .push_blocking(entry, &context.stop)
+            .is_err()
+        {
+            return false;
+        }
+        context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+
+        if reader.has_next() {
+            buffer.push(reader.next());
+        }
+    }
+
+    reader.has_next() && !context.stop.load(Ordering::Acquire)
+}
+
+fn fill_shuffle_buffer(
+    reader: &mut CompressedTrainingDataEntryReader<File>,
+    buffer: &mut Vec<TrainingDataEntry>,
+    target_len: usize,
+) {
+    while buffer.len() < target_len && reader.has_next() {
+        buffer.push(reader.next());
+    }
+}
+
+fn pop_shuffled_entry(
+    buffer: &mut Vec<TrainingDataEntry>,
+    rng: &mut SmallRng,
+) -> Option<TrainingDataEntry> {
+    if buffer.is_empty() {
+        return None;
+    }
+
+    let index = rng.gen_range(0..buffer.len());
+    Some(buffer.swap_remove(index))
+}
+
+fn push_ordered_entries(
+    reader: &mut CompressedTrainingDataEntryReader<File>,
+    buffer: &mut VecDeque<TrainingDataEntry>,
+    context: &ThreadContext,
+) -> bool {
+    while let Some(entry) = buffer.pop_front() {
+        if context
+            .position_queue
+            .push_blocking(entry, &context.stop)
+            .is_err()
+        {
+            return false;
+        }
+        context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    if !reader.has_next() || context.stop.load(Ordering::Acquire) {
+        return false;
+    }
+
+    buffer.push_back(reader.next());
+
+    true
 }
 
 fn encoder_worker(
