@@ -89,9 +89,22 @@ class RustSparseBatchProvider:
                 "Rust dataloader DDP support is not implemented yet"
             )
 
-        encoding_threads = max(1, num_workers)
-        slab_count = max(8, min(encoding_threads, 16))
-        position_queue_capacity = max(1 << 18, batch_size * max(8, encoding_threads))
+        decoder_threads = max(1, len(filenames))
+        skip_heavy = (
+            config.filtered
+            or config.wld_filtered
+            or config.random_fen_skipping > 0
+            or config.early_fen_skipping >= 0
+            or config.simple_eval_skipping > 0
+        )
+
+        if skip_heavy:
+            encoding_threads = max(1, min(num_workers, decoder_threads * 2))
+        else:
+            encoding_threads = max(1, num_workers)
+
+        slab_count = max(4, min(encoding_threads + 2, 8))
+        position_queue_capacity = max(1 << 16, batch_size * max(4, decoder_threads * 2))
         position_queue_high_watermark = position_queue_capacity * 7 // 8
         position_queue_low_watermark = position_queue_capacity // 2
         shuffle_buffer_entries = max(65_536, min(batch_size * 2, 262_144))

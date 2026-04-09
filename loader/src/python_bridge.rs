@@ -9,7 +9,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::feature_extraction::FeatureSet;
-use crate::pipeline::{BatchPipeline, PipelineConfig, PipelineError, PooledBatch, SkipConfig};
+use crate::pipeline::{
+    default_batch_slab_count, default_chunk_queue_capacity, default_encoder_chunk_size,
+    BatchPipeline, PipelineConfig, PipelineError, PooledBatch, SkipConfig,
+};
 
 #[pyclass(name = "BatchStream")]
 pub struct PyBatchStream {
@@ -143,6 +146,8 @@ impl PyBatchStream {
         dict.set_item("skipped_entries", stats.skipped_entries)?;
         dict.set_item("produced_batches", stats.produced_batches)?;
         dict.set_item("position_queue_len", stats.position_queue_len)?;
+        dict.set_item("ready_chunks_len", stats.ready_chunks_len)?;
+        dict.set_item("free_chunks_len", stats.free_chunks_len)?;
         dict.set_item("ready_slabs_len", stats.ready_slabs_len)?;
         dict.set_item("free_slabs_len", stats.free_slabs_len)?;
         Ok(dict)
@@ -261,7 +266,11 @@ impl PyBatchStream {
         }
         if let Some(value) = slab_count {
             config.slab_count = value;
+        } else {
+            config.slab_count = default_batch_slab_count(config.encoding_threads);
         }
+        config.encoder_chunk_size = default_encoder_chunk_size(batch_size, config.encoding_threads);
+        config.chunk_queue_capacity = default_chunk_queue_capacity(config.encoding_threads);
         if let Some(value) = position_queue_capacity {
             config.position_queue_capacity = value;
             if position_queue_high_watermark.is_none() {

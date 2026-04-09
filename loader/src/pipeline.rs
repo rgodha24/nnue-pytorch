@@ -157,9 +157,9 @@ impl PipelineConfig {
             feature_set,
             batch_size,
             encoding_threads,
-            slab_count: encoding_threads.max(2),
+            slab_count: default_batch_slab_count(encoding_threads),
             encoder_chunk_size,
-            chunk_queue_capacity: encoding_threads.saturating_mul(2).max(4),
+            chunk_queue_capacity: default_chunk_queue_capacity(encoding_threads),
             position_queue_capacity,
             position_queue_high_watermark: position_queue_capacity * 99 / 100,
             position_queue_low_watermark: position_queue_capacity / 2,
@@ -786,6 +786,7 @@ fn decoder_worker(
 ) {
     let base_seed = config.seed.unwrap_or_else(random_seed);
     let mut rng = SmallRng::seed_from_u64(base_seed ^ worker_index as u64);
+    let mut skip_decider = SkipDecider::new(config.skip_config);
     let mut shuffled_entries = Vec::with_capacity(config.shuffle_buffer_entries);
     let mut ordered_entries = VecDeque::with_capacity(config.shuffle_buffer_entries.min(1024));
 
@@ -830,13 +831,19 @@ fn decoder_worker(
                 if !push_shuffled_entries(
                     &mut reader,
                     &mut shuffled_entries,
+                    &mut skip_decider,
                     &mut rng,
-                    &config,
                     &context,
                 ) {
                     break;
                 }
-            } else if !push_ordered_entries(&mut reader, &mut ordered_entries, &context) {
+            } else if !push_ordered_entries(
+                &mut reader,
+                &mut ordered_entries,
+                &mut skip_decider,
+                &mut rng,
+                &context,
+            ) {
                 break;
             }
         }
@@ -854,20 +861,15 @@ fn decoder_worker(
 fn push_shuffled_entries(
     reader: &mut CompressedTrainingDataEntryReader<File>,
     buffer: &mut Vec<TrainingDataEntry>,
+    skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
-    config: &PipelineConfig,
     context: &ThreadContext,
 ) -> bool {
-    fill_shuffle_buffer(reader, buffer, config.shuffle_buffer_entries);
+    fill_shuffle_buffer(reader, buffer, context);
     while let Some(entry) = pop_shuffled_entry(buffer, rng) {
-        if context
-            .position_queue
-            .push_blocking(entry, &context.stop)
-            .is_err()
-        {
+        if !emit_or_skip_decoded_entry(entry, context, skip_decider, rng) {
             return false;
         }
-        context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
 
         if reader.has_next() {
             buffer.push(reader.next());
@@ -880,9 +882,12 @@ fn push_shuffled_entries(
 fn fill_shuffle_buffer(
     reader: &mut CompressedTrainingDataEntryReader<File>,
     buffer: &mut Vec<TrainingDataEntry>,
-    target_len: usize,
+    context: &ThreadContext,
 ) {
-    while buffer.len() < target_len && reader.has_next() {
+    while buffer.len() < buffer.capacity()
+        && reader.has_next()
+        && !context.stop.load(Ordering::Acquire)
+    {
         buffer.push(reader.next());
     }
 }
@@ -902,17 +907,14 @@ fn pop_shuffled_entry(
 fn push_ordered_entries(
     reader: &mut CompressedTrainingDataEntryReader<File>,
     buffer: &mut VecDeque<TrainingDataEntry>,
+    skip_decider: &mut SkipDecider,
+    rng: &mut SmallRng,
     context: &ThreadContext,
 ) -> bool {
     while let Some(entry) = buffer.pop_front() {
-        if context
-            .position_queue
-            .push_blocking(entry, &context.stop)
-            .is_err()
-        {
+        if !emit_or_skip_decoded_entry(entry, context, skip_decider, rng) {
             return false;
         }
-        context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
     }
 
     if !reader.has_next() || context.stop.load(Ordering::Acquire) {
@@ -924,23 +926,33 @@ fn push_ordered_entries(
     true
 }
 
+fn emit_or_skip_decoded_entry(
+    entry: TrainingDataEntry,
+    context: &ThreadContext,
+    skip_decider: &mut SkipDecider,
+    rng: &mut SmallRng,
+) -> bool {
+    context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+    if skip_decider.should_skip(&entry, rng) {
+        context.stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
+        return true;
+    }
+
+    context
+        .position_queue
+        .push_blocking(entry, &context.stop)
+        .is_ok()
+}
+
 fn encoder_worker(
-    worker_index: usize,
+    _worker_index: usize,
     config: PipelineConfig,
     context: ThreadContext,
     active_encoders: Arc<AtomicUsize>,
 ) {
-    let base_seed = config.seed.unwrap_or_else(random_seed);
-    let mut rng = SmallRng::seed_from_u64(base_seed ^ (1 << 20) ^ worker_index as u64);
-    let mut skip_decider = SkipDecider::new(config.skip_config);
     let mut current_chunk: Option<HostBatchSlab> = None;
 
     while let Some(entry) = context.position_queue.pop_blocking(&context.stop) {
-        if skip_decider.should_skip(&entry, &mut rng) {
-            context.stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
-            continue;
-        }
-
         if current_chunk.is_none() {
             current_chunk = context.free_chunks.pop_blocking(&context.stop);
             if current_chunk.is_none() {
@@ -977,7 +989,7 @@ fn encoder_worker(
     }
 }
 
-fn assembler_worker(config: PipelineConfig, context: ThreadContext) {
+fn assembler_worker(_config: PipelineConfig, context: ThreadContext) {
     let mut current_slab: Option<HostBatchSlab> = None;
 
     while let Some(mut chunk) = context.ready_chunks.pop_blocking(&context.stop) {
@@ -1023,7 +1035,6 @@ fn assembler_worker(config: PipelineConfig, context: ThreadContext) {
         }
     }
 
-    let _ = config;
     context.ready_slabs.close();
 }
 
@@ -1133,13 +1144,6 @@ fn score_result_prob(entry: &TrainingDataEntry) -> f64 {
     }
 }
 
-fn count_active_features(features: &[i32]) -> usize {
-    features
-        .iter()
-        .take_while(|&&feature| feature != -1)
-        .count()
-}
-
 fn feature_values_from_indices(features: &[i32]) -> Vec<f32> {
     features
         .iter()
@@ -1151,7 +1155,7 @@ fn random_seed() -> u64 {
     rand::thread_rng().gen()
 }
 
-fn default_encoder_chunk_size(batch_size: usize, encoding_threads: usize) -> usize {
+pub(crate) fn default_encoder_chunk_size(batch_size: usize, encoding_threads: usize) -> usize {
     if encoding_threads <= 1 {
         return batch_size;
     }
@@ -1161,6 +1165,14 @@ fn default_encoder_chunk_size(batch_size: usize, encoding_threads: usize) -> usi
         .max(1);
 
     target.clamp(512, 4096).min(batch_size)
+}
+
+pub(crate) fn default_chunk_queue_capacity(encoding_threads: usize) -> usize {
+    encoding_threads.saturating_mul(2).max(4)
+}
+
+pub(crate) fn default_batch_slab_count(encoding_threads: usize) -> usize {
+    encoding_threads.saturating_add(2).clamp(4, 8)
 }
 
 #[cfg(test)]
