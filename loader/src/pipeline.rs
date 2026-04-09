@@ -865,14 +865,14 @@ fn push_shuffled_entries(
     rng: &mut SmallRng,
     context: &ThreadContext,
 ) -> bool {
-    fill_shuffle_buffer(reader, buffer, context);
+    fill_shuffle_buffer(reader, buffer, context, skip_decider, rng);
     while let Some(entry) = pop_shuffled_entry(buffer, rng) {
-        if !emit_or_skip_decoded_entry(entry, context, skip_decider, rng) {
+        if !emit_decoded_entry(entry, context) {
             return false;
         }
 
         if reader.has_next() {
-            buffer.push(reader.next());
+            maybe_buffer_shuffled_entry(reader.next(), buffer, context, skip_decider, rng);
         }
     }
 
@@ -883,12 +883,14 @@ fn fill_shuffle_buffer(
     reader: &mut CompressedTrainingDataEntryReader<File>,
     buffer: &mut Vec<TrainingDataEntry>,
     context: &ThreadContext,
+    skip_decider: &mut SkipDecider,
+    rng: &mut SmallRng,
 ) {
     while buffer.len() < buffer.capacity()
         && reader.has_next()
         && !context.stop.load(Ordering::Acquire)
     {
-        buffer.push(reader.next());
+        maybe_buffer_shuffled_entry(reader.next(), buffer, context, skip_decider, rng);
     }
 }
 
@@ -912,7 +914,7 @@ fn push_ordered_entries(
     context: &ThreadContext,
 ) -> bool {
     while let Some(entry) = buffer.pop_front() {
-        if !emit_or_skip_decoded_entry(entry, context, skip_decider, rng) {
+        if !emit_decoded_entry(entry, context) {
             return false;
         }
     }
@@ -921,23 +923,44 @@ fn push_ordered_entries(
         return false;
     }
 
-    buffer.push_back(reader.next());
+    maybe_buffer_ordered_entry(reader.next(), buffer, context, skip_decider, rng);
 
     true
 }
 
-fn emit_or_skip_decoded_entry(
+fn maybe_buffer_shuffled_entry(
     entry: TrainingDataEntry,
+    buffer: &mut Vec<TrainingDataEntry>,
     context: &ThreadContext,
     skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
-) -> bool {
+) {
     context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
     if skip_decider.should_skip(&entry, rng) {
         context.stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
-        return true;
+        return;
     }
 
+    buffer.push(entry);
+}
+
+fn maybe_buffer_ordered_entry(
+    entry: TrainingDataEntry,
+    buffer: &mut VecDeque<TrainingDataEntry>,
+    context: &ThreadContext,
+    skip_decider: &mut SkipDecider,
+    rng: &mut SmallRng,
+) {
+    context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+    if skip_decider.should_skip(&entry, rng) {
+        context.stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+
+    buffer.push_back(entry);
+}
+
+fn emit_decoded_entry(entry: TrainingDataEntry, context: &ThreadContext) -> bool {
     context
         .position_queue
         .push_blocking(entry, &context.stop)
