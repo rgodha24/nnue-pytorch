@@ -16,7 +16,7 @@ pub struct PyBatchStream {
     pipeline: Mutex<Option<BatchPipeline>>,
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct PyBatchOwner {
     batch: PooledBatch,
     psqt_indices_i64: Vec<i64>,

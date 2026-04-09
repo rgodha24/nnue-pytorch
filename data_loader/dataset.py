@@ -1,6 +1,9 @@
-import threading
 import queue
+import threading
+from collections.abc import Iterator
+from typing import cast
 
+import nnue_loader
 import torch
 from torch.utils.data import Dataset
 
@@ -26,7 +29,7 @@ class FenBatchProvider:
         num_workers,
         batch_size=None,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
-        ddp_config: DataloaderDDPConfig = None,
+        ddp_config: DataloaderDDPConfig | None = None,
     ):
         self.filename = filename
         self.cyclic = cyclic
@@ -41,7 +44,7 @@ class FenBatchProvider:
                 batch_size,
                 cyclic,
                 config,
-                ddp_config,
+                cast(DataloaderDDPConfig, ddp_config),
             )
         else:
             # doesnt work yet
@@ -70,70 +73,7 @@ class FenBatchProvider:
         stream.destroy_fen_batch_stream(self.stream)
 
 
-class TrainingDataProvider:
-    def __init__(
-        self,
-        feature_set: str,
-        create_stream,
-        destroy_stream,
-        fetch_next,
-        destroy_part,
-        filenames: list[str],
-        cyclic,
-        num_workers,
-        batch_size=None,
-        config: DataloaderSkipConfig = DataloaderSkipConfig(),
-        ddp_config: DataloaderDDPConfig = None,
-    ):
-        self.feature_set = feature_set.encode("utf-8")
-        self.create_stream = create_stream
-        self.destroy_stream = destroy_stream
-        self.fetch_next = fetch_next
-        self.destroy_part = destroy_part
-        self.filenames = filenames
-        self.cyclic = cyclic
-        self.num_workers = num_workers
-        self.batch_size = batch_size
-        self.config = config
-
-        if batch_size:
-            self.stream = self.create_stream(
-                self.feature_set,
-                self.num_workers,
-                self.filenames,
-                batch_size,
-                cyclic,
-                config,
-                ddp_config,
-            )
-        else:
-            self.stream = self.create_stream(
-                self.feature_set,
-                self.num_workers,
-                self.filenames,
-                cyclic,
-                config,
-                ddp_config,
-            )
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        v = self.fetch_next(self.stream)
-
-        if v:
-            tensors = v.contents.get_tensors("cpu")
-            self.destroy_part(v)
-            return tensors
-        else:
-            raise StopIteration
-
-    def __del__(self):
-        self.destroy_stream(self.stream)
-
-
-class SparseBatchProvider(TrainingDataProvider):
+class RustSparseBatchProvider:
     def __init__(
         self,
         feature_set: str,
@@ -142,21 +82,68 @@ class SparseBatchProvider(TrainingDataProvider):
         cyclic=True,
         num_workers=1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
-        ddp_config: DataloaderDDPConfig = None,
+        ddp_config: DataloaderDDPConfig | None = None,
     ):
-        super().__init__(
-            feature_set,
-            stream.create_sparse_batch_stream,
-            stream.destroy_sparse_batch_stream,
-            stream.fetch_next_sparse_batch,
-            stream.destroy_sparse_batch,
+        if ddp_config is not None and ddp_config.world_size != 1:
+            raise NotImplementedError(
+                "Rust dataloader DDP support is not implemented yet"
+            )
+
+        encoding_threads = max(1, num_workers)
+        slab_count = min(max(2, encoding_threads), 8)
+
+        self.stream = nnue_loader.BatchStream(
+            feature_set.replace("^", ""),
             filenames,
-            cyclic,
-            num_workers,
             batch_size,
-            config,
-            ddp_config,
+            encoding_threads=encoding_threads,
+            slab_count=slab_count,
+            cyclic=cyclic,
+            filtered=config.filtered,
+            random_fen_skipping=config.random_fen_skipping,
+            wld_filtered=config.wld_filtered,
+            early_fen_skipping=config.early_fen_skipping,
+            simple_eval_skipping=config.simple_eval_skipping,
+            param_index=config.param_index,
+            pc_y1=config.pc_y1,
+            pc_y2=config.pc_y2,
+            pc_y3=config.pc_y3,
         )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        batch = self.stream.next_batch()
+        if batch is None:
+            raise StopIteration
+
+        us = torch.from_numpy(batch["is_white"])
+        them = 1.0 - us
+        white_indices = torch.from_numpy(batch["white"])
+        black_indices = torch.from_numpy(batch["black"])
+        outcome = torch.from_numpy(batch["outcome"])
+        score = torch.from_numpy(batch["score"])
+        psqt_indices = torch.from_numpy(batch["psqt_indices"])
+        layer_stack_indices = torch.from_numpy(batch["layer_stack_indices"])
+
+        return (
+            us,
+            them,
+            white_indices,
+            black_indices,
+            outcome,
+            score,
+            psqt_indices,
+            layer_stack_indices,
+        )
+
+    def __del__(self):
+        if hasattr(self, "stream"):
+            self.stream.close()
+
+
+SparseBatchProvider = RustSparseBatchProvider
 
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
@@ -168,7 +155,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         cyclic=True,
         num_workers=1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
-        ddp_config: DataloaderDDPConfig = None,
+        ddp_config: DataloaderDDPConfig | None = None,
     ):
         super().__init__()
         self.feature_set = feature_set
@@ -195,7 +182,7 @@ class FixedNumBatchesDataset(Dataset):
     def __init__(self, dataset, num_batches, pin_memory=False, queue_size_limit=None):
         super().__init__()
         self.dataset = dataset
-        self.iter = None  # Deferred to _start_prefetching
+        self.iter: Iterator | None = None  # Deferred to _start_prefetching
         self.num_batches = num_batches
         self.pin_memory = pin_memory
         if queue_size_limit is None:
@@ -220,6 +207,7 @@ class FixedNumBatchesDataset(Dataset):
         try:
             while not self._stop_prefetching.is_set():
                 try:
+                    assert self.iter is not None
                     item = next(self.iter)
                     # Pin memory on worker thread if enabled.
                     if self.pin_memory:
@@ -248,6 +236,7 @@ class FixedNumBatchesDataset(Dataset):
         self._start_prefetching()
 
         try:
+            assert self.iter is not None
             item = self._prefetch_queue.get(timeout=300.0)  # 300 second timeout
 
             if item is None:
