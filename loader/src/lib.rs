@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 pub mod feature_extraction;
 pub mod pipeline;
+mod python_bridge;
 pub use sfbinpack::chess;
 
 /// Test function to verify the module is wired correctly
@@ -13,5 +14,6 @@ fn hello() -> String {
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hello, m)?)?;
+    python_bridge::register(m)?;
     Ok(())
 }

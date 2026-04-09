@@ -22,7 +22,10 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-nnue-loader = { path = "loader", editable = true }
+nnue-loader = { workspace = true }
+
+[tool.uv.workspace]
+members = ["loader"]
 
 [tool.setuptools]
 py-modules = []

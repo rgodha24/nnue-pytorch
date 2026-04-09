@@ -425,9 +425,17 @@ impl HostBatchSlab {
         &self.white[start..start + self.max_active_features]
     }
 
+    pub fn white_flat_slice(&self) -> &[i32] {
+        &self.white[..self.size * self.max_active_features]
+    }
+
     pub fn black_row(&self, row: usize) -> &[i32] {
         let start = row * self.max_active_features;
         &self.black[start..start + self.max_active_features]
+    }
+
+    pub fn black_flat_slice(&self) -> &[i32] {
+        &self.black[..self.size * self.max_active_features]
     }
 
     pub fn white_values_row(&self, row: usize) -> &[f32] {
@@ -435,9 +443,17 @@ impl HostBatchSlab {
         &self.white_values[start..start + self.max_active_features]
     }
 
+    pub fn white_values_flat_slice(&self) -> &[f32] {
+        &self.white_values[..self.size * self.max_active_features]
+    }
+
     pub fn black_values_row(&self, row: usize) -> &[f32] {
         let start = row * self.max_active_features;
         &self.black_values[start..start + self.max_active_features]
+    }
+
+    pub fn black_values_flat_slice(&self) -> &[f32] {
+        &self.black_values[..self.size * self.max_active_features]
     }
 
     pub fn copy_row(&self, row: usize) -> SparseRow {
