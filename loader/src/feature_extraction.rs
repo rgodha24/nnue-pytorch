@@ -5,6 +5,7 @@ use sfbinpack::chess::{
     attacks, bitboard::Bitboard, color::Color, coords::Square, piece::Piece, piecetype::PieceType,
     position::Position,
 };
+use sfbinpack::TrainingDataEntry;
 
 pub const HALFKA_INPUTS: usize = 24_576;
 pub const HALFKA_MAX_ACTIVE_FEATURES: usize = 32;
@@ -76,6 +77,17 @@ pub struct SparseRow {
     pub black: Vec<i32>,
     pub white_values: Vec<f32>,
     pub black_values: Vec<f32>,
+    pub psqt_indices: i32,
+    pub layer_stack_indices: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowMetadata {
+    pub is_white: f32,
+    pub outcome: f32,
+    pub score: f32,
+    pub white_count: usize,
+    pub black_count: usize,
     pub psqt_indices: i32,
     pub layer_stack_indices: i32,
 }
@@ -228,6 +240,26 @@ pub fn build_sparse_row(pos: &Position, score: i32, result: i32) -> SparseRow {
     build_sparse_row_for_feature_set(pos, score, result, &FeatureSet::halfka())
 }
 
+pub fn encode_training_entry(
+    entry: &TrainingDataEntry,
+    feature_set: &FeatureSet,
+    white: &mut [i32],
+    white_values: &mut [f32],
+    black: &mut [i32],
+    black_values: &mut [f32],
+) -> RowMetadata {
+    fill_row_from_position(
+        &entry.pos,
+        entry.score as i32,
+        entry.result as i32,
+        feature_set,
+        white,
+        white_values,
+        black,
+        black_values,
+    )
+}
+
 pub fn build_sparse_row_for_feature_set(
     pos: &Position,
     score: i32,
@@ -235,31 +267,40 @@ pub fn build_sparse_row_for_feature_set(
     feature_set: &FeatureSet,
 ) -> SparseRow {
     let max_active_features = feature_set.max_active_features();
-    let piece_count = pos.occupied().count() as i32;
     let mut row = SparseRow {
         num_inputs: feature_set.inputs(),
         max_active_features,
-        is_white: if pos.side_to_move() == Color::White {
-            1.0
-        } else {
-            0.0
-        },
-        outcome: (result as f32 + 1.0) / 2.0,
-        score: score as f32,
+        is_white: 0.0,
+        outcome: 0.0,
+        score: 0.0,
         white_count: 0,
         black_count: 0,
         white: vec![-1; max_active_features],
         black: vec![-1; max_active_features],
         white_values: vec![0.0; max_active_features],
         black_values: vec![0.0; max_active_features],
-        psqt_indices: (piece_count - 1) / 4,
-        layer_stack_indices: (piece_count - 1) / 4,
+        psqt_indices: 0,
+        layer_stack_indices: 0,
     };
 
-    row.white_count =
-        feature_set.fill_features_sparse(pos, Color::White, &mut row.white, &mut row.white_values);
-    row.black_count =
-        feature_set.fill_features_sparse(pos, Color::Black, &mut row.black, &mut row.black_values);
+    let metadata = fill_row_from_position(
+        pos,
+        score,
+        result,
+        feature_set,
+        &mut row.white,
+        &mut row.white_values,
+        &mut row.black,
+        &mut row.black_values,
+    );
+
+    row.is_white = metadata.is_white;
+    row.outcome = metadata.outcome;
+    row.score = metadata.score;
+    row.white_count = metadata.white_count;
+    row.black_count = metadata.black_count;
+    row.psqt_indices = metadata.psqt_indices;
+    row.layer_stack_indices = metadata.layer_stack_indices;
 
     row
 }
@@ -288,6 +329,45 @@ fn fill_halfka_features_sparse(
     }
 
     count
+}
+
+fn fill_row_from_position(
+    pos: &Position,
+    score: i32,
+    result: i32,
+    feature_set: &FeatureSet,
+    white: &mut [i32],
+    white_values: &mut [f32],
+    black: &mut [i32],
+    black_values: &mut [f32],
+) -> RowMetadata {
+    debug_assert_eq!(white.len(), feature_set.max_active_features());
+    debug_assert_eq!(white_values.len(), feature_set.max_active_features());
+    debug_assert_eq!(black.len(), feature_set.max_active_features());
+    debug_assert_eq!(black_values.len(), feature_set.max_active_features());
+
+    white.fill(-1);
+    white_values.fill(0.0);
+    black.fill(-1);
+    black_values.fill(0.0);
+
+    let white_count = feature_set.fill_features_sparse(pos, Color::White, white, white_values);
+    let black_count = feature_set.fill_features_sparse(pos, Color::Black, black, black_values);
+    let piece_count = pos.occupied().count() as i32;
+
+    RowMetadata {
+        is_white: if pos.side_to_move() == Color::White {
+            1.0
+        } else {
+            0.0
+        },
+        outcome: (result as f32 + 1.0) / 2.0,
+        score: score as f32,
+        white_count,
+        black_count,
+        psqt_indices: (piece_count - 1) / 4,
+        layer_stack_indices: (piece_count - 1) / 4,
+    }
 }
 
 fn fill_full_threats_sparse(

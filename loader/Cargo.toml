@@ -14,16 +14,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 sfbinpack = "0.6.2"
-# TODO: Add dependencies as needed:
-# numpy = "0.24"
-# memmap2 = "0.9"
-# rayon = "1.8"
-# crossbeam-channel = "0.5"
-# thiserror = "1.0"
-# serde = { version = "1.0", features = ["derive"] }
+crossbeam-queue = "0.3"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]
 libloading = "0.8"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
