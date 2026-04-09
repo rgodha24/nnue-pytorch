@@ -175,8 +175,9 @@ impl CppReference {
         }
     }
 
-    pub fn halfka_batch_from_fens(
+    pub fn batch_from_fens(
         &self,
+        feature_set: &str,
         fens: &[String],
         scores: &[i32],
         plies: &[i32],
@@ -189,8 +190,8 @@ impl CppReference {
             return Err("FEN, score, ply, and result lengths must match".to_string());
         }
 
-        let feature_name =
-            CString::new("HalfKAv2_hm").expect("feature set literal cannot contain NUL");
+        let feature_name = CString::new(feature_set)
+            .map_err(|_| format!("feature set contains interior NUL: {feature_set}"))?;
         let fen_storage = fens
             .iter()
             .map(|fen| {

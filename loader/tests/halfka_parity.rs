@@ -1,52 +1,71 @@
+use std::str::FromStr;
+
 use nnue_loader::chess::position::Position;
-use nnue_loader::feature_extraction::{build_sparse_row, INPUTS, MAX_ACTIVE_FEATURES};
+use nnue_loader::feature_extraction::{build_sparse_row_for_feature_set, FeatureSet, SparseRow};
 
 #[path = "support/cpp_reference.rs"]
 mod cpp_reference;
 
 use cpp_reference::{default_binpack_path, CppReference, ReferenceBatch};
 
+const HALFKA: &str = "HalfKAv2_hm";
+const FULL_THREATS: &str = "Full_Threats";
+const COMPOSED: &str = "Full_Threats+HalfKAv2_hm";
+
 #[test]
 fn curated_halfka_rows_match_cpp_reference() {
+    assert_feature_set_matches_cpp(HALFKA, curated_fens());
+}
+
+#[test]
+fn sampled_halfka_rows_match_cpp_reference() {
+    assert_sampled_feature_set_matches_cpp(HALFKA, 32);
+}
+
+#[test]
+fn curated_full_threat_rows_match_cpp_reference() {
+    assert_feature_set_matches_cpp(FULL_THREATS, curated_fens());
+}
+
+#[test]
+fn sampled_full_threat_rows_match_cpp_reference() {
+    assert_sampled_feature_set_matches_cpp(FULL_THREATS, 24);
+}
+
+#[test]
+fn curated_composed_rows_match_cpp_reference() {
+    assert_feature_set_matches_cpp(COMPOSED, curated_fens());
+}
+
+#[test]
+fn sampled_composed_rows_match_cpp_reference() {
+    assert_sampled_feature_set_matches_cpp(COMPOSED, 16);
+}
+
+fn assert_feature_set_matches_cpp(feature_name: &str, fens: Vec<String>) {
     let cpp = CppReference::load().expect("load C++ loader shared library for parity testing");
-    let fens = curated_fens();
+    let feature_set = FeatureSet::from_str(feature_name).expect("feature set should parse");
     let scores = make_scores(fens.len());
     let plies = make_plies(fens.len());
     let results = make_results(fens.len());
 
     let batch = cpp
-        .halfka_batch_from_fens(&fens, &scores, &plies, &results)
-        .expect("obtain C++ reference batch for curated FENs");
+        .batch_from_fens(feature_name, &fens, &scores, &plies, &results)
+        .expect("obtain C++ reference batch");
 
-    assert_eq!(batch.num_inputs, INPUTS as i32);
-    assert_eq!(batch.size, fens.len());
-    assert_eq!(batch.max_active_features, MAX_ACTIVE_FEATURES);
-
-    let mut white_total = 0i32;
-    let mut black_total = 0i32;
-
-    for row in 0..fens.len() {
-        let pos = Position::from_fen(&fens[row]).expect("curated FEN should parse");
-        let rust_row = build_sparse_row(&pos, scores[row], results[row]);
-        assert_row_matches_cpp(&batch, row, &rust_row);
-        white_total += rust_row.white_count as i32;
-        black_total += rust_row.black_count as i32;
-    }
-
-    assert_eq!(batch.num_active_white_features, white_total);
-    assert_eq!(batch.num_active_black_features, black_total);
+    assert_batch_matches_rust(&feature_set, &batch, &fens, &scores, &results);
 }
 
-#[test]
-fn sampled_dataset_halfka_rows_match_cpp_reference() {
+fn assert_sampled_feature_set_matches_cpp(feature_name: &str, sample_size: usize) {
     let Some(binpack_path) = default_binpack_path() else {
         eprintln!("skipping dataset parity sample: no .binpack file found under nnue-data/");
         return;
     };
 
     let cpp = CppReference::load().expect("load C++ loader shared library for parity testing");
+    let feature_set = FeatureSet::from_str(feature_name).expect("feature set should parse");
     let fens = cpp
-        .sample_fens(&binpack_path, 64)
+        .sample_fens(&binpack_path, sample_size)
         .expect("sample FENs from the current C++ loader");
     assert!(
         !fens.is_empty(),
@@ -58,16 +77,31 @@ fn sampled_dataset_halfka_rows_match_cpp_reference() {
     let results = make_results(fens.len());
 
     let batch = cpp
-        .halfka_batch_from_fens(&fens, &scores, &plies, &results)
-        .expect("obtain C++ reference batch for sampled dataset FENs");
+        .batch_from_fens(feature_name, &fens, &scores, &plies, &results)
+        .expect("obtain sampled C++ reference batch");
+
+    assert_batch_matches_rust(&feature_set, &batch, &fens, &scores, &results);
+}
+
+fn assert_batch_matches_rust(
+    feature_set: &FeatureSet,
+    batch: &ReferenceBatch,
+    fens: &[String],
+    scores: &[i32],
+    results: &[i32],
+) {
+    assert_eq!(batch.size, fens.len());
+    assert_eq!(batch.num_inputs, feature_set.inputs() as i32);
+    assert_eq!(batch.max_active_features, feature_set.max_active_features());
 
     let mut white_total = 0i32;
     let mut black_total = 0i32;
 
     for row in 0..fens.len() {
-        let pos = Position::from_fen(&fens[row]).expect("sampled dataset FEN should parse");
-        let rust_row = build_sparse_row(&pos, scores[row], results[row]);
-        assert_row_matches_cpp(&batch, row, &rust_row);
+        let pos = Position::from_fen(&fens[row]).expect("parity FEN should parse");
+        let rust_row =
+            build_sparse_row_for_feature_set(&pos, scores[row], results[row], feature_set);
+        assert_row_matches_cpp(batch, row, &rust_row);
         white_total += rust_row.white_count as i32;
         black_total += rust_row.black_count as i32;
     }
@@ -76,35 +110,27 @@ fn sampled_dataset_halfka_rows_match_cpp_reference() {
     assert_eq!(batch.num_active_black_features, black_total);
 }
 
-fn assert_row_matches_cpp(
-    batch: &ReferenceBatch,
-    row: usize,
-    rust_row: &nnue_loader::feature_extraction::SparseRow,
-) {
-    let cpp_is_white = batch.is_white[row];
-    let cpp_outcome = batch.outcome[row];
-    let cpp_score = batch.score[row];
-    let cpp_psqt = batch.psqt_indices[row];
-    let cpp_layer_stack = batch.layer_stack_indices[row];
-
+fn assert_row_matches_cpp(batch: &ReferenceBatch, row: usize, rust_row: &SparseRow) {
     assert_eq!(
-        cpp_is_white, rust_row.is_white,
+        batch.is_white[row], rust_row.is_white,
         "is_white mismatch at row {row}"
     );
     assert_eq!(
-        cpp_outcome, rust_row.outcome,
+        batch.outcome[row], rust_row.outcome,
         "outcome mismatch at row {row}"
     );
-    assert_eq!(cpp_score, rust_row.score, "score mismatch at row {row}");
     assert_eq!(
-        cpp_psqt, rust_row.psqt_indices,
+        batch.score[row], rust_row.score,
+        "score mismatch at row {row}"
+    );
+    assert_eq!(
+        batch.psqt_indices[row], rust_row.psqt_indices,
         "psqt index mismatch at row {row}"
     );
     assert_eq!(
-        cpp_layer_stack, rust_row.layer_stack_indices,
+        batch.layer_stack_indices[row], rust_row.layer_stack_indices,
         "layer stack index mismatch at row {row}"
     );
-
     assert_eq!(
         batch.white_row(row),
         rust_row.white.as_slice(),
@@ -126,12 +152,14 @@ fn assert_row_matches_cpp(
         "black value row mismatch at row {row}"
     );
 
-    assert!(
-        rust_row.white_count == count_active_features(batch.white_row(row)),
+    assert_eq!(
+        rust_row.white_count,
+        count_active_features(batch.white_row(row)),
         "white active feature count mismatch at row {row}"
     );
-    assert!(
-        rust_row.black_count == count_active_features(batch.black_row(row)),
+    assert_eq!(
+        rust_row.black_count,
+        count_active_features(batch.black_row(row)),
         "black active feature count mismatch at row {row}"
     );
 }
