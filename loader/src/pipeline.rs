@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -22,6 +23,10 @@ const BINPACK_HEADER_SIZE: usize = 8;
 const BINPACK_MAX_CHUNK_SIZE: u32 = 100 * 1024 * 1024;
 const DECODER_COUNTER_FLUSH_INTERVAL: u64 = 4096;
 const ENCODER_COUNTER_FLUSH_INTERVAL: u64 = 4096;
+const WLD_MAX_PLY: usize = 240;
+const WLD_SCORE_SCALE: f32 = 100.0 / 208.0;
+
+static WLD_PARAMS: OnceLock<Box<[WldParams]>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
@@ -146,6 +151,12 @@ struct DecoderWorkerCounters {
 #[derive(Default)]
 struct EncoderWorkerCounters {
     encoded_entries: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WldParams {
+    a: f32,
+    inv_b: f32,
 }
 
 #[derive(Clone)]
@@ -792,10 +803,11 @@ impl SkipDecider {
         if self.config.filtered && (is_capturing_move(entry) || is_in_check(entry)) {
             return true;
         }
-        if self.config.wld_filtered
-            && rng.gen_bool((1.0 - score_result_prob(entry)).clamp(0.0, 1.0))
-        {
-            return true;
+        if self.config.wld_filtered {
+            let keep_prob = score_result_prob(entry);
+            if keep_prob <= 0.0 || (keep_prob < 1.0 && rng.gen::<f32>() >= keep_prob) {
+                return true;
+            }
         }
         if self.config.simple_eval_skipping > 0
             && simple_eval(&entry.pos).abs() < self.config.simple_eval_skipping
@@ -1511,24 +1523,33 @@ fn material_count(
     pos.pieces_bb_color(color, piece_type).count() as i32
 }
 
-fn score_result_prob(entry: &TrainingDataEntry) -> f64 {
-    let m = entry.ply.min(240) as f64 / 64.0;
-    let as_ = [-3.68389304, 30.07065921, -60.52878723, 149.53378557];
-    let bs = [-2.0181857, 15.85685038, -29.83452023, 47.59078827];
-    let a = (((as_[0] * m + as_[1]) * m + as_[2]) * m) + as_[3];
-    let mut b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
-    b *= 1.5;
+fn build_wld_params() -> Box<[WldParams]> {
+    let as_ = [-3.683_893_f32, 30.070_66, -60.528_79, 149.533_78];
+    let bs = [-2.018_185_6_f32, 15.856_851, -29.834_52, 47.590_79];
 
-    let x = ((100.0 * entry.score as f64) / 208.0).clamp(-2000.0, 2000.0);
-    let w = 1.0 / (1.0 + ((a - x) / b).exp());
-    let l = 1.0 / (1.0 + ((a + x) / b).exp());
+    (0..=WLD_MAX_PLY)
+        .map(|ply| {
+            let m = ply as f32 / 64.0;
+            let a = (((as_[0] * m + as_[1]) * m + as_[2]) * m) + as_[3];
+            let b = ((((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3]) * 1.5;
+            WldParams { a, inv_b: 1.0 / b }
+        })
+        .collect()
+}
+
+fn score_result_prob(entry: &TrainingDataEntry) -> f32 {
+    let params =
+        &WLD_PARAMS.get_or_init(build_wld_params)[entry.ply.min(WLD_MAX_PLY as u16) as usize];
+    let x = (entry.score as f32 * WLD_SCORE_SCALE).clamp(-2000.0, 2000.0);
 
     if entry.result > 0 {
-        w
+        1.0 / (1.0 + ((params.a - x) * params.inv_b).exp())
     } else if entry.result < 0 {
-        l
+        1.0 / (1.0 + ((params.a + x) * params.inv_b).exp())
     } else {
-        1.0 - w - l
+        let w = 1.0 / (1.0 + ((params.a - x) * params.inv_b).exp());
+        let l = 1.0 / (1.0 + ((params.a + x) * params.inv_b).exp());
+        (1.0 - w - l).max(0.0)
     }
 }
 
@@ -1565,7 +1586,9 @@ pub(crate) fn default_batch_slab_count(encoding_threads: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
     use std::str::FromStr;
+    use std::time::Instant;
 
     use sfbinpack::chess::{
         coords::Square,
@@ -1616,6 +1639,97 @@ mod tests {
             0,
         );
         assert!(decider.should_skip(&simple_eval_low, &mut rng));
+    }
+
+    #[test]
+    fn score_result_prob_matches_formula() {
+        for score in [-2000, -512, -1, 0, 1, 512, 2000] {
+            for ply in [0, 1, 32, 64, 120, 240, 400] {
+                for result in [-1, 0, 1] {
+                    let entry = make_entry(
+                        "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+                        Move::normal(sq("e1"), sq("e2")),
+                        score,
+                        ply,
+                        result,
+                    );
+                    let actual = score_result_prob(&entry);
+                    let expected = score_result_prob_reference(&entry);
+
+                    assert!((actual - expected).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn bench_score_result_prob() {
+        let entries = benchmark_entries();
+        let iterations = 5_000_000usize;
+        let start = Instant::now();
+        let mut total = 0.0f32;
+
+        for index in 0..iterations {
+            total += score_result_prob(black_box(&entries[index % entries.len()]));
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        println!(
+            "score_result_prob: {:.3} Mpos/s",
+            iterations as f64 / elapsed / 1e6
+        );
+        black_box(total);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark"]
+    fn bench_skip_decider_paths() {
+        let entries = benchmark_entries();
+        let iterations = 5_000_000usize;
+
+        for (name, config) in [
+            (
+                "filtered_only",
+                SkipConfig {
+                    filtered: true,
+                    ..SkipConfig::default()
+                },
+            ),
+            (
+                "wld_only",
+                SkipConfig {
+                    wld_filtered: true,
+                    ..SkipConfig::default()
+                },
+            ),
+            (
+                "filtered_and_wld",
+                SkipConfig {
+                    filtered: true,
+                    wld_filtered: true,
+                    ..SkipConfig::default()
+                },
+            ),
+        ] {
+            let start = Instant::now();
+            let mut rng = SmallRng::seed_from_u64(7);
+            let mut decider = SkipDecider::new(config);
+            let mut skipped = 0usize;
+
+            for index in 0..iterations {
+                skipped += decider.should_skip(black_box(&entries[index % entries.len()]), &mut rng)
+                    as usize;
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            println!(
+                "{name}: {:.3} Mpos/s skipped={}",
+                iterations as f64 / elapsed / 1e6,
+                skipped
+            );
+            black_box(skipped);
+        }
     }
 
     #[test]
@@ -1735,6 +1849,26 @@ mod tests {
         ]
     }
 
+    fn benchmark_entries() -> Vec<TrainingDataEntry> {
+        let base_entries = sample_entries();
+        let mut entries = Vec::with_capacity(4096);
+
+        for index in 0..4096usize {
+            let mut entry = base_entries[index % base_entries.len()];
+            let signed = ((index as i32 * 73) % 4001) - 2000;
+            entry.score = signed as i16;
+            entry.ply = (index % 320) as u16;
+            entry.result = match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            };
+            entries.push(entry);
+        }
+
+        entries
+    }
+
     fn write_entries(entries: &[TrainingDataEntry]) -> NamedTempFile {
         let file = NamedTempFile::new().expect("temporary binpack file should be created");
         let writer_file = file.reopen().expect("temporary file should be reopenable");
@@ -1763,6 +1897,25 @@ mod tests {
 
     fn sq(name: &str) -> Square {
         Square::from_string(name).expect("square should parse")
+    }
+
+    fn score_result_prob_reference(entry: &TrainingDataEntry) -> f32 {
+        let m = entry.ply.min(240) as f32 / 64.0;
+        let as_ = [-3.683_893_f32, 30.070_66, -60.528_79, 149.533_78];
+        let bs = [-2.018_185_6_f32, 15.856_851, -29.834_52, 47.590_79];
+        let a = (((as_[0] * m + as_[1]) * m + as_[2]) * m) + as_[3];
+        let b = ((((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3]) * 1.5;
+        let x = (entry.score as f32 * WLD_SCORE_SCALE).clamp(-2000.0, 2000.0);
+        let w = 1.0 / (1.0 + ((a - x) / b).exp());
+        let l = 1.0 / (1.0 + ((a + x) / b).exp());
+
+        if entry.result > 0 {
+            w
+        } else if entry.result < 0 {
+            l
+        } else {
+            1.0 - w - l
+        }
     }
 
     #[allow(dead_code)]
