@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,6 +18,10 @@ use crate::feature_extraction::{
 
 const VALUE_NONE: i16 = 32002;
 const MAX_SKIP_RATE: f64 = 10.0;
+const BINPACK_HEADER_SIZE: usize = 8;
+const BINPACK_MAX_CHUNK_SIZE: u32 = 100 * 1024 * 1024;
+const DECODER_COUNTER_FLUSH_INTERVAL: u64 = 4096;
+const ENCODER_COUNTER_FLUSH_INTERVAL: u64 = 4096;
 
 #[derive(Clone, Debug)]
 pub struct PipelineConfig {
@@ -117,6 +122,30 @@ struct PipelineCounters {
     encoded_entries: AtomicU64,
     skipped_entries: AtomicU64,
     produced_batches: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChunkTask {
+    file_index: usize,
+    offset: u64,
+    size: u32,
+}
+
+struct ChunkScheduler {
+    tasks: Arc<[ChunkTask]>,
+    next_index: AtomicUsize,
+    cyclic: bool,
+}
+
+#[derive(Default)]
+struct DecoderWorkerCounters {
+    decoded_entries: u64,
+    skipped_entries: u64,
+}
+
+#[derive(Default)]
+struct EncoderWorkerCounters {
+    encoded_entries: u64,
 }
 
 #[derive(Clone)]
@@ -280,17 +309,53 @@ impl BatchPipeline {
             stats: Arc::clone(&stats),
         };
 
-        let mut workers = Vec::with_capacity(config.files.len() + config.encoding_threads + 1);
-        let active_decoders = Arc::new(AtomicUsize::new(config.files.len()));
+        let chunk_scheduler = if config.shuffle_chunks {
+            let tasks = scan_chunk_tasks(&config.files)?;
+            if tasks.is_empty() {
+                None
+            } else {
+                Some(Arc::new(ChunkScheduler::new(tasks, config.cyclic)))
+            }
+        } else {
+            None
+        };
+        let decoder_workers = chunk_scheduler
+            .as_ref()
+            .map(|scheduler| preferred_decoder_workers(&config, scheduler.task_count()))
+            .unwrap_or(config.files.len());
+
+        let mut workers = Vec::with_capacity(decoder_workers + config.encoding_threads + 1);
+        let active_decoders = Arc::new(AtomicUsize::new(decoder_workers));
         let active_encoders = Arc::new(AtomicUsize::new(config.encoding_threads));
 
-        for (index, path) in config.files.iter().cloned().enumerate() {
-            let context = context.clone();
-            let config = config.clone();
-            let active_decoders = Arc::clone(&active_decoders);
-            workers.push(thread::spawn(move || {
-                decoder_worker(index, path, config, context, active_decoders)
-            }));
+        if let Some(chunk_scheduler) = chunk_scheduler {
+            let files = Arc::new(config.files.clone());
+            for index in 0..decoder_workers {
+                let context = context.clone();
+                let config = config.clone();
+                let active_decoders = Arc::clone(&active_decoders);
+                let files = Arc::clone(&files);
+                let chunk_scheduler = Arc::clone(&chunk_scheduler);
+                workers.push(thread::spawn(move || {
+                    chunk_decoder_worker(
+                        index,
+                        files,
+                        chunk_scheduler,
+                        config,
+                        context,
+                        active_decoders,
+                    )
+                }));
+            }
+        } else {
+            for (index, path) in config.files.iter().cloned().enumerate() {
+                let context = context.clone();
+                let config = config.clone();
+                let active_decoders = Arc::clone(&active_decoders);
+                workers.push(thread::spawn(move || {
+                    decoder_worker(index, path, config, context, active_decoders)
+                }));
+            }
         }
 
         for index in 0..config.encoding_threads {
@@ -777,6 +842,33 @@ impl SkipDecider {
     }
 }
 
+impl ChunkScheduler {
+    fn new(tasks: Vec<ChunkTask>, cyclic: bool) -> Self {
+        Self {
+            tasks: tasks.into(),
+            next_index: AtomicUsize::new(0),
+            cyclic,
+        }
+    }
+
+    fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn claim(&self) -> Option<ChunkTask> {
+        if self.tasks.is_empty() {
+            return None;
+        }
+
+        let index = self.next_index.fetch_add(1, Ordering::AcqRel);
+        if self.cyclic {
+            Some(self.tasks[index % self.tasks.len()])
+        } else {
+            self.tasks.get(index).copied()
+        }
+    }
+}
+
 fn decoder_worker(
     worker_index: usize,
     path: PathBuf,
@@ -789,6 +881,7 @@ fn decoder_worker(
     let mut skip_decider = SkipDecider::new(config.skip_config);
     let mut shuffled_entries = Vec::with_capacity(config.shuffle_buffer_entries);
     let mut ordered_entries = VecDeque::with_capacity(config.shuffle_buffer_entries.min(1024));
+    let mut counters = DecoderWorkerCounters::default();
 
     loop {
         if context.stop.load(Ordering::Acquire) {
@@ -826,71 +919,182 @@ fn decoder_worker(
             }
         };
 
-        loop {
-            if config.shuffle_chunks {
-                if !push_shuffled_entries(
-                    &mut reader,
-                    &mut shuffled_entries,
-                    &mut skip_decider,
-                    &mut rng,
-                    &context,
-                ) {
-                    break;
-                }
-            } else if !push_ordered_entries(
-                &mut reader,
-                &mut ordered_entries,
-                &mut skip_decider,
-                &mut rng,
-                &context,
-            ) {
-                break;
-            }
-        }
+        drain_reader(
+            &mut reader,
+            &config,
+            &mut shuffled_entries,
+            &mut ordered_entries,
+            &mut skip_decider,
+            &mut rng,
+            &context,
+            &mut counters,
+        );
 
         if !config.cyclic {
             break;
         }
     }
 
+    flush_decoder_counters(&mut counters, &context);
     if active_decoders.fetch_sub(1, Ordering::AcqRel) == 1 {
         context.position_queue.close();
     }
 }
 
-fn push_shuffled_entries(
-    reader: &mut CompressedTrainingDataEntryReader<File>,
+fn chunk_decoder_worker(
+    worker_index: usize,
+    files: Arc<Vec<PathBuf>>,
+    scheduler: Arc<ChunkScheduler>,
+    config: PipelineConfig,
+    context: ThreadContext,
+    active_decoders: Arc<AtomicUsize>,
+) {
+    let base_seed = config.seed.unwrap_or_else(random_seed);
+    let mut rng = SmallRng::seed_from_u64(base_seed ^ worker_index as u64);
+    let mut skip_decider = SkipDecider::new(config.skip_config);
+    let mut shuffled_entries = Vec::with_capacity(config.shuffle_buffer_entries);
+    let mut ordered_entries = VecDeque::with_capacity(config.shuffle_buffer_entries.min(1024));
+    let mut counters = DecoderWorkerCounters::default();
+    let mut chunk_buffer = Vec::new();
+    let mut file_handles = std::iter::repeat_with(|| None)
+        .take(files.len())
+        .collect::<Vec<Option<File>>>();
+
+    loop {
+        if context.stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        let Some(task) = scheduler.claim() else {
+            break;
+        };
+
+        if let Err(error) =
+            read_chunk_into_buffer(&mut file_handles, files.as_slice(), task, &mut chunk_buffer)
+        {
+            report_error(
+                &context,
+                format!(
+                    "failed to read chunk from {} at offset {}: {error}",
+                    files[task.file_index].display(),
+                    task.offset
+                ),
+            );
+            break;
+        }
+
+        let cursor = Cursor::new(chunk_buffer.as_slice());
+        let mut reader = match CompressedTrainingDataEntryReader::new(cursor) {
+            Ok(reader) => reader,
+            Err(CompressedReaderError::EndOfFile) => continue,
+            Err(error) => {
+                report_error(
+                    &context,
+                    format!(
+                        "failed to decode chunk from {} at offset {}: {error}",
+                        files[task.file_index].display(),
+                        task.offset
+                    ),
+                );
+                break;
+            }
+        };
+
+        drain_reader(
+            &mut reader,
+            &config,
+            &mut shuffled_entries,
+            &mut ordered_entries,
+            &mut skip_decider,
+            &mut rng,
+            &context,
+            &mut counters,
+        );
+    }
+
+    flush_decoder_counters(&mut counters, &context);
+    if active_decoders.fetch_sub(1, Ordering::AcqRel) == 1 {
+        context.position_queue.close();
+    }
+}
+
+fn drain_reader<T: Read + Seek>(
+    reader: &mut CompressedTrainingDataEntryReader<T>,
+    config: &PipelineConfig,
+    shuffled_entries: &mut Vec<TrainingDataEntry>,
+    ordered_entries: &mut VecDeque<TrainingDataEntry>,
+    skip_decider: &mut SkipDecider,
+    rng: &mut SmallRng,
+    context: &ThreadContext,
+    counters: &mut DecoderWorkerCounters,
+) {
+    loop {
+        if config.shuffle_chunks {
+            if !push_shuffled_entries(
+                reader,
+                shuffled_entries,
+                skip_decider,
+                rng,
+                context,
+                counters,
+            ) {
+                break;
+            }
+        } else if !push_ordered_entries(
+            reader,
+            ordered_entries,
+            skip_decider,
+            rng,
+            context,
+            counters,
+        ) {
+            break;
+        }
+    }
+}
+
+fn push_shuffled_entries<T: Read + Seek>(
+    reader: &mut CompressedTrainingDataEntryReader<T>,
     buffer: &mut Vec<TrainingDataEntry>,
     skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
     context: &ThreadContext,
+    counters: &mut DecoderWorkerCounters,
 ) -> bool {
-    fill_shuffle_buffer(reader, buffer, context, skip_decider, rng);
+    fill_shuffle_buffer(reader, buffer, context, skip_decider, rng, counters);
     while let Some(entry) = pop_shuffled_entry(buffer, rng) {
         if !emit_decoded_entry(entry, context) {
             return false;
         }
 
         if reader.has_next() {
-            maybe_buffer_shuffled_entry(reader.next(), buffer, context, skip_decider, rng);
+            maybe_buffer_shuffled_entry(
+                reader.next(),
+                buffer,
+                context,
+                skip_decider,
+                rng,
+                counters,
+            );
         }
     }
 
     reader.has_next() && !context.stop.load(Ordering::Acquire)
 }
 
-fn fill_shuffle_buffer(
-    reader: &mut CompressedTrainingDataEntryReader<File>,
+fn fill_shuffle_buffer<T: Read + Seek>(
+    reader: &mut CompressedTrainingDataEntryReader<T>,
     buffer: &mut Vec<TrainingDataEntry>,
     context: &ThreadContext,
     skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
+    counters: &mut DecoderWorkerCounters,
 ) {
     while buffer.len() < buffer.capacity()
         && reader.has_next()
         && !context.stop.load(Ordering::Acquire)
     {
-        maybe_buffer_shuffled_entry(reader.next(), buffer, context, skip_decider, rng);
+        maybe_buffer_shuffled_entry(reader.next(), buffer, context, skip_decider, rng, counters);
     }
 }
 
@@ -906,12 +1110,13 @@ fn pop_shuffled_entry(
     Some(buffer.swap_remove(index))
 }
 
-fn push_ordered_entries(
-    reader: &mut CompressedTrainingDataEntryReader<File>,
+fn push_ordered_entries<T: Read + Seek>(
+    reader: &mut CompressedTrainingDataEntryReader<T>,
     buffer: &mut VecDeque<TrainingDataEntry>,
     skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
     context: &ThreadContext,
+    counters: &mut DecoderWorkerCounters,
 ) -> bool {
     while let Some(entry) = buffer.pop_front() {
         if !emit_decoded_entry(entry, context) {
@@ -923,7 +1128,7 @@ fn push_ordered_entries(
         return false;
     }
 
-    maybe_buffer_ordered_entry(reader.next(), buffer, context, skip_decider, rng);
+    maybe_buffer_ordered_entry(reader.next(), buffer, context, skip_decider, rng, counters);
 
     true
 }
@@ -934,14 +1139,17 @@ fn maybe_buffer_shuffled_entry(
     context: &ThreadContext,
     skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
+    counters: &mut DecoderWorkerCounters,
 ) {
-    context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+    counters.decoded_entries += 1;
     if skip_decider.should_skip(&entry, rng) {
-        context.stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
+        counters.skipped_entries += 1;
+        flush_decoder_counters_if_needed(counters, context);
         return;
     }
 
     buffer.push(entry);
+    flush_decoder_counters_if_needed(counters, context);
 }
 
 fn maybe_buffer_ordered_entry(
@@ -950,14 +1158,17 @@ fn maybe_buffer_ordered_entry(
     context: &ThreadContext,
     skip_decider: &mut SkipDecider,
     rng: &mut SmallRng,
+    counters: &mut DecoderWorkerCounters,
 ) {
-    context.stats.decoded_entries.fetch_add(1, Ordering::AcqRel);
+    counters.decoded_entries += 1;
     if skip_decider.should_skip(&entry, rng) {
-        context.stats.skipped_entries.fetch_add(1, Ordering::AcqRel);
+        counters.skipped_entries += 1;
+        flush_decoder_counters_if_needed(counters, context);
         return;
     }
 
     buffer.push_back(entry);
+    flush_decoder_counters_if_needed(counters, context);
 }
 
 fn emit_decoded_entry(entry: TrainingDataEntry, context: &ThreadContext) -> bool {
@@ -974,6 +1185,7 @@ fn encoder_worker(
     active_encoders: Arc<AtomicUsize>,
 ) {
     let mut current_chunk: Option<HostBatchSlab> = None;
+    let mut counters = EncoderWorkerCounters::default();
 
     while let Some(entry) = context.position_queue.pop_blocking(&context.stop) {
         if current_chunk.is_none() {
@@ -985,7 +1197,8 @@ fn encoder_worker(
 
         let chunk = current_chunk.as_mut().unwrap();
         chunk.push_entry(&entry, &config.feature_set);
-        context.stats.encoded_entries.fetch_add(1, Ordering::AcqRel);
+        counters.encoded_entries += 1;
+        flush_encoder_counters_if_needed(&mut counters, &context);
 
         if chunk.is_full() {
             let full_chunk = current_chunk.take().unwrap();
@@ -999,6 +1212,7 @@ fn encoder_worker(
         }
     }
 
+    flush_encoder_counters(&mut counters, &context);
     if let Some(chunk) = current_chunk.take() {
         if chunk.is_empty() {
             let _ = context.free_chunks.push_blocking(chunk, &context.stop);
@@ -1083,6 +1297,158 @@ fn report_error(context: &ThreadContext, message: String) {
     context.free_slabs.close();
 }
 
+fn preferred_decoder_workers(config: &PipelineConfig, task_count: usize) -> usize {
+    if task_count == 0 {
+        return config.files.len();
+    }
+
+    let available_threads = thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1);
+    let spare_threads = available_threads
+        .saturating_sub(config.encoding_threads)
+        .max(1);
+    let target = config.files.len().max(spare_threads.min(4));
+
+    target.min(task_count)
+}
+
+fn scan_chunk_tasks(files: &[PathBuf]) -> Result<Vec<ChunkTask>, PipelineError> {
+    let mut tasks = Vec::new();
+    for (file_index, path) in files.iter().enumerate() {
+        scan_file_chunk_tasks(path, file_index, &mut tasks)?;
+    }
+    Ok(tasks)
+}
+
+fn scan_file_chunk_tasks(
+    path: &PathBuf,
+    file_index: usize,
+    tasks: &mut Vec<ChunkTask>,
+) -> Result<(), PipelineError> {
+    let mut file = File::open(path).map_err(|error| {
+        PipelineError::new(format!("failed to open {}: {error}", path.display()))
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| {
+            PipelineError::new(format!(
+                "failed to read metadata for {}: {error}",
+                path.display()
+            ))
+        })?
+        .len();
+    let mut header = [0u8; BINPACK_HEADER_SIZE];
+    let mut offset = 0u64;
+
+    while offset < file_len {
+        file.read_exact(&mut header).map_err(|error| {
+            PipelineError::new(format!(
+                "failed to read chunk header from {} at offset {}: {error}",
+                path.display(),
+                offset
+            ))
+        })?;
+        if &header[..4] != b"BINP" {
+            return Err(PipelineError::new(format!(
+                "invalid binpack chunk magic in {} at offset {}",
+                path.display(),
+                offset
+            )));
+        }
+
+        let size = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if size > BINPACK_MAX_CHUNK_SIZE {
+            return Err(PipelineError::new(format!(
+                "chunk in {} at offset {} exceeds supported size",
+                path.display(),
+                offset
+            )));
+        }
+
+        let next_offset = offset + BINPACK_HEADER_SIZE as u64 + size as u64;
+        if next_offset > file_len {
+            return Err(PipelineError::new(format!(
+                "chunk in {} at offset {} is truncated",
+                path.display(),
+                offset
+            )));
+        }
+
+        tasks.push(ChunkTask {
+            file_index,
+            offset,
+            size,
+        });
+        file.seek(SeekFrom::Current(size as i64)).map_err(|error| {
+            PipelineError::new(format!(
+                "failed to skip chunk payload in {} at offset {}: {error}",
+                path.display(),
+                offset
+            ))
+        })?;
+        offset = next_offset;
+    }
+
+    Ok(())
+}
+
+fn read_chunk_into_buffer(
+    file_handles: &mut [Option<File>],
+    files: &[PathBuf],
+    task: ChunkTask,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    if file_handles[task.file_index].is_none() {
+        file_handles[task.file_index] = Some(File::open(&files[task.file_index])?);
+    }
+
+    let file = file_handles[task.file_index].as_mut().unwrap();
+    buffer.resize(BINPACK_HEADER_SIZE + task.size as usize, 0);
+    file.seek(SeekFrom::Start(task.offset))?;
+    file.read_exact(buffer.as_mut_slice())?;
+    Ok(())
+}
+
+fn flush_decoder_counters_if_needed(counters: &mut DecoderWorkerCounters, context: &ThreadContext) {
+    if counters.decoded_entries >= DECODER_COUNTER_FLUSH_INTERVAL {
+        flush_decoder_counters(counters, context);
+    }
+}
+
+fn flush_decoder_counters(counters: &mut DecoderWorkerCounters, context: &ThreadContext) {
+    if counters.decoded_entries > 0 {
+        context
+            .stats
+            .decoded_entries
+            .fetch_add(counters.decoded_entries, Ordering::AcqRel);
+        counters.decoded_entries = 0;
+    }
+    if counters.skipped_entries > 0 {
+        context
+            .stats
+            .skipped_entries
+            .fetch_add(counters.skipped_entries, Ordering::AcqRel);
+        counters.skipped_entries = 0;
+    }
+}
+
+fn flush_encoder_counters_if_needed(counters: &mut EncoderWorkerCounters, context: &ThreadContext) {
+    if counters.encoded_entries >= ENCODER_COUNTER_FLUSH_INTERVAL {
+        flush_encoder_counters(counters, context);
+    }
+}
+
+fn flush_encoder_counters(counters: &mut EncoderWorkerCounters, context: &ThreadContext) {
+    if counters.encoded_entries > 0 {
+        context
+            .stats
+            .encoded_entries
+            .fetch_add(counters.encoded_entries, Ordering::AcqRel);
+        counters.encoded_entries = 0;
+    }
+}
+
 fn desired_piece_count_weight(config: SkipConfig, piece_count: i32) -> f64 {
     let x = piece_count as f64;
     let x1 = 0.0;
@@ -1156,14 +1522,13 @@ fn score_result_prob(entry: &TrainingDataEntry) -> f64 {
     let x = ((100.0 * entry.score as f64) / 208.0).clamp(-2000.0, 2000.0);
     let w = 1.0 / (1.0 + ((a - x) / b).exp());
     let l = 1.0 / (1.0 + ((a + x) / b).exp());
-    let d = 1.0 - w - l;
 
     if entry.result > 0 {
         w
     } else if entry.result < 0 {
         l
     } else {
-        d
+        1.0 - w - l
     }
 }
 
