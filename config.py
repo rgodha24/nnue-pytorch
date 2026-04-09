@@ -50,8 +50,8 @@ class TrainingConfig:
     threads: int = -1
     """Number of torch threads to use. Default automatic (cores)."""
 
-    compile_backend: Literal["inductor", "cudagraphs"] = "inductor"
-    """Which backend to use for torch.compile. inductor works well with larger nets, cudagraphs with smaller nets."""
+    compile_backend: Literal["inductor", "cudagraphs", "none"] = "inductor"
+    """Which backend to use for torch.compile. Set to none to skip torch.compile entirely."""
 
     seed: int = 42
     """Torch seed to use."""

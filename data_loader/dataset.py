@@ -90,7 +90,11 @@ class RustSparseBatchProvider:
             )
 
         encoding_threads = max(1, num_workers)
-        slab_count = min(max(2, encoding_threads), 8)
+        slab_count = max(8, min(encoding_threads, 16))
+        position_queue_capacity = max(1 << 18, batch_size * max(8, encoding_threads))
+        position_queue_high_watermark = position_queue_capacity * 7 // 8
+        position_queue_low_watermark = position_queue_capacity // 2
+        shuffle_buffer_entries = max(65_536, min(batch_size * 2, 262_144))
 
         self.stream = nnue_loader.BatchStream(
             feature_set.replace("^", ""),
@@ -98,6 +102,10 @@ class RustSparseBatchProvider:
             batch_size,
             encoding_threads=encoding_threads,
             slab_count=slab_count,
+            position_queue_capacity=position_queue_capacity,
+            position_queue_high_watermark=position_queue_high_watermark,
+            position_queue_low_watermark=position_queue_low_watermark,
+            shuffle_buffer_entries=shuffle_buffer_entries,
             cyclic=cyclic,
             filtered=config.filtered,
             random_fen_skipping=config.random_fen_skipping,

@@ -394,9 +394,10 @@ def main():
         save_top_k=-1,
     )
 
-    # Since we compile the entire lightning module we have quite a few graph breaks
-    torch._dynamo.config.cache_size_limit = 32
-    nnue = torch.compile(nnue, backend=args.compile_backend)
+    if args.compile_backend != "none":
+        # Since we compile the entire lightning module we have quite a few graph breaks
+        torch._dynamo.config.cache_size_limit = 32
+        nnue = torch.compile(nnue, backend=args.compile_backend)
     # PL hack, undo slurm cluster detection which is broken for us. 'force interactive mode'
     # see lightning/fabric/plugins/environments/slurm.py near line 110
     os.environ["SLURM_JOB_NAME"] = "bash"
