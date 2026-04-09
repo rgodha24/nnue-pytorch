@@ -133,6 +133,18 @@ impl FeatureComponent {
             Self::FullThreats => fill_full_threats_sparse(pos, color, features, values),
         }
     }
+
+    fn fill_feature_indices_sparse(
+        self,
+        pos: &Position,
+        color: Color,
+        features: &mut [i32],
+    ) -> usize {
+        match self {
+            Self::HalfKAv2Hm => fill_halfka_feature_indices_sparse(pos, color, features),
+            Self::FullThreats => fill_full_threat_feature_indices_sparse(pos, color, features),
+        }
+    }
 }
 
 impl FeatureSet {
@@ -183,6 +195,36 @@ impl FeatureSet {
                 color,
                 &mut features[total_written..total_written + component_max],
                 &mut values[total_written..total_written + component_max],
+            );
+
+            if input_offset != 0 {
+                for feature in &mut features[total_written..total_written + written] {
+                    *feature += input_offset;
+                }
+            }
+
+            input_offset += component.inputs() as i32;
+            total_written += written;
+        }
+
+        total_written
+    }
+
+    pub fn fill_feature_indices_sparse(
+        &self,
+        pos: &Position,
+        color: Color,
+        features: &mut [i32],
+    ) -> usize {
+        let mut total_written = 0usize;
+        let mut input_offset = 0i32;
+
+        for component in &self.components {
+            let component_max = component.max_active_features();
+            let written = component.fill_feature_indices_sparse(
+                pos,
+                color,
+                &mut features[total_written..total_written + component_max],
             );
 
             if input_offset != 0 {
@@ -260,6 +302,22 @@ pub fn encode_training_entry(
     )
 }
 
+pub fn encode_training_entry_indices_only(
+    entry: &TrainingDataEntry,
+    feature_set: &FeatureSet,
+    white: &mut [i32],
+    black: &mut [i32],
+) -> RowMetadata {
+    fill_row_from_position_without_values(
+        &entry.pos,
+        entry.score as i32,
+        entry.result as i32,
+        feature_set,
+        white,
+        black,
+    )
+}
+
 pub fn build_sparse_row_for_feature_set(
     pos: &Position,
     score: i32,
@@ -331,6 +389,22 @@ fn fill_halfka_features_sparse(
     count
 }
 
+fn fill_halfka_feature_indices_sparse(pos: &Position, color: Color, features: &mut [i32]) -> usize {
+    let mut count = 0usize;
+    let mut occupied = pos.occupied();
+    let ksq = pos.king_sq(color);
+
+    while occupied.bits() != 0 {
+        let sq = occupied.pop();
+        let piece = pos.piece_at(sq);
+
+        features[count] = halfka_feature_index(color, ksq, sq, piece);
+        count += 1;
+    }
+
+    count
+}
+
 fn fill_row_from_position(
     pos: &Position,
     score: i32,
@@ -353,6 +427,39 @@ fn fill_row_from_position(
 
     let white_count = feature_set.fill_features_sparse(pos, Color::White, white, white_values);
     let black_count = feature_set.fill_features_sparse(pos, Color::Black, black, black_values);
+    let piece_count = pos.occupied().count() as i32;
+
+    RowMetadata {
+        is_white: if pos.side_to_move() == Color::White {
+            1.0
+        } else {
+            0.0
+        },
+        outcome: (result as f32 + 1.0) / 2.0,
+        score: score as f32,
+        white_count,
+        black_count,
+        psqt_indices: (piece_count - 1) / 4,
+        layer_stack_indices: (piece_count - 1) / 4,
+    }
+}
+
+fn fill_row_from_position_without_values(
+    pos: &Position,
+    score: i32,
+    result: i32,
+    feature_set: &FeatureSet,
+    white: &mut [i32],
+    black: &mut [i32],
+) -> RowMetadata {
+    debug_assert_eq!(white.len(), feature_set.max_active_features());
+    debug_assert_eq!(black.len(), feature_set.max_active_features());
+
+    white.fill(-1);
+    black.fill(-1);
+
+    let white_count = feature_set.fill_feature_indices_sparse(pos, Color::White, white);
+    let black_count = feature_set.fill_feature_indices_sparse(pos, Color::Black, black);
     let piece_count = pos.occupied().count() as i32;
 
     RowMetadata {
@@ -459,6 +566,102 @@ fn fill_full_threats_sparse(
                             full_threat_index(perspective, attacker, from, to, attacked, ksq);
                         if index >= 0 {
                             values[count] = 1.0;
+                            features[count] = index;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    count
+}
+
+fn fill_full_threat_feature_indices_sparse(
+    pos: &Position,
+    perspective: Color,
+    features: &mut [i32],
+) -> usize {
+    let occupied = pos.occupied();
+    let occupied_bits = occupied.bits();
+    let occupied_pawns_bits = (pos.pieces_bb_color(Color::White, PieceType::Pawn)
+        | pos.pieces_bb_color(Color::Black, PieceType::Pawn))
+    .bits();
+    let ksq = pos.king_sq(perspective);
+    let color_order = match perspective {
+        Color::White => [Color::White, Color::Black],
+        Color::Black => [Color::Black, Color::White],
+    };
+    let mut count = 0usize;
+
+    for color in color_order {
+        for piece_type in [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+            PieceType::King,
+        ] {
+            let attacker = Piece::new(piece_type, color);
+            let piece_bb = pos.pieces_bb_color(color, piece_type);
+
+            if piece_type == PieceType::Pawn {
+                let attacks_left =
+                    Bitboard::new(pawn_attack_left_targets(piece_bb.bits(), color) & occupied_bits);
+                let attacks_right = Bitboard::new(
+                    pawn_attack_right_targets(piece_bb.bits(), color) & occupied_bits,
+                );
+                let attacks_forward =
+                    Bitboard::new(pawn_push_targets(piece_bb.bits(), color) & occupied_pawns_bits);
+
+                for to in attacks_left.iter() {
+                    let from = match color {
+                        Color::White => Square::new(to.index() - 9),
+                        Color::Black => Square::new(to.index() + 9),
+                    };
+                    let attacked = pos.piece_at(to);
+                    let index = full_threat_index(perspective, attacker, from, to, attacked, ksq);
+                    if index >= 0 {
+                        features[count] = index;
+                        count += 1;
+                    }
+                }
+
+                for to in attacks_right.iter() {
+                    let from = match color {
+                        Color::White => Square::new(to.index() - 7),
+                        Color::Black => Square::new(to.index() + 7),
+                    };
+                    let attacked = pos.piece_at(to);
+                    let index = full_threat_index(perspective, attacker, from, to, attacked, ksq);
+                    if index >= 0 {
+                        features[count] = index;
+                        count += 1;
+                    }
+                }
+
+                for to in attacks_forward.iter() {
+                    let from = match color {
+                        Color::White => Square::new(to.index() - 8),
+                        Color::Black => Square::new(to.index() + 8),
+                    };
+                    let attacked = pos.piece_at(to);
+                    let index = full_threat_index(perspective, attacker, from, to, attacked, ksq);
+                    if index >= 0 {
+                        features[count] = index;
+                        count += 1;
+                    }
+                }
+            } else {
+                for from in piece_bb.iter() {
+                    let attacks = attacks::piece_attacks(piece_type, from, occupied) & occupied;
+                    for to in attacks.iter() {
+                        let attacked = pos.piece_at(to);
+                        let index =
+                            full_threat_index(perspective, attacker, from, to, attacked, ksq);
+                        if index >= 0 {
                             features[count] = index;
                             count += 1;
                         }

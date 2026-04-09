@@ -14,7 +14,6 @@ from model.modules.feature_transformer.functions import (
 
 def SparseLinearFunctionEmulate(
     input_indices: torch.Tensor,
-    input_values: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
 ) -> torch.Tensor:
@@ -27,8 +26,9 @@ def SparseLinearFunctionEmulate(
     for i in range(batch_size):
         for j in range(max_active_indices):
             feature = input_indices[i, j]
-            value = input_values[i, j]
-            inputs[i, feature] += value
+            if feature == -1:
+                break
+            inputs[i, feature] += 1.0
 
     return torch.mm(inputs, weight) + bias
 
@@ -52,26 +52,23 @@ def test():
     indices1 = (torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES) * INPUT_SIZE).to(
         dtype=torch.int32
     )
-    values0 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32)
-    values1 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32)
-
-    output00 = SparseLinearFunctionEmulate(
-        indices0.clone(), values0.clone(), weight0, bias0
-    )
-    output01 = SparseLinearFunctionEmulate(
-        indices1.clone(), values1.clone(), weight0, bias0
-    )
+    output00 = SparseLinearFunctionEmulate(indices0.clone(), weight0, bias0)
+    output01 = SparseLinearFunctionEmulate(indices1.clone(), weight0, bias0)
     output10 = SparseLinearFunction.apply(
-        indices0.clone().cuda(), values0.clone().cuda(), weight1.cuda(), bias1.cuda()
+        indices0.clone().cuda(), weight1.cuda(), bias1.cuda()
     )
     output11 = SparseLinearFunction.apply(
-        indices1.clone().cuda(), values1.clone().cuda(), weight1.cuda(), bias1.cuda()
+        indices1.clone().cuda(), weight1.cuda(), bias1.cuda()
     )
 
     assert torch.max(torch.abs(output00.cpu() - output10.cpu())) < MAX_ERROR
     assert torch.max(torch.abs(output01.cpu() - output11.cpu())) < MAX_ERROR
     (output00 - output01).sum().backward()
     (output10 - output11).sum().backward()
+    assert weight0.grad is not None
+    assert bias0.grad is not None
+    assert weight1.grad is not None
+    assert bias1.grad is not None
     assert torch.max(torch.abs(weight0.grad.cpu() - weight1.grad.cpu())) < MAX_ERROR
     assert torch.max(torch.abs(bias0.grad.cpu() - bias1.grad.cpu())) < MAX_ERROR
     print("Tests passed.")
@@ -100,14 +97,12 @@ def bench():
 
     layer = DoubleFeatureTransformer(INPUT_SIZE, STRIDE).cuda()
     indices0 = get_fake_indices()
-    values0 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32).cuda()
     indices1 = get_fake_indices()
-    values1 = torch.rand(BATCH_SIZE, MAX_ACTIVE_FEATURES, dtype=torch.float32).cuda()
 
     start = time.time()
 
     for _ in range(ITERS):
-        output0, output1 = layer(indices0, values0, indices1, values1)
+        output0, output1 = layer(indices0, indices1)
         output0 = torch.clamp(output0, 0.0, 1.0)
         output1 = torch.clamp(output1, 0.0, 1.0)
 

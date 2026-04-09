@@ -9,15 +9,11 @@ from .kernel import (
 
 class SparseLinearFunction(autograd.Function):
     @staticmethod
-    def forward(ctx, feature_indices, feature_values, weight, bias):
-        ctx.save_for_backward(feature_indices, feature_values, weight, bias)
+    def forward(ctx, feature_indices, weight, bias):
+        ctx.save_for_backward(feature_indices, weight, bias)
 
         assert len(feature_indices.shape) == 2
-        assert len(feature_values.shape) == 2
-        assert feature_indices.shape[0] == feature_values.shape[0]
-        assert feature_indices.shape[1] == feature_values.shape[1]
         assert feature_indices.dtype == torch.int32
-        assert feature_values.dtype == torch.float32
 
         assert len(weight.shape) == 2
         assert weight.dtype == torch.float32
@@ -26,16 +22,13 @@ class SparseLinearFunction(autograd.Function):
         assert bias.dtype == torch.float32
 
         assert feature_indices.is_cuda
-        assert feature_values.is_cuda
         assert weight.is_cuda
         assert bias.is_cuda
 
-        assert feature_values.device == feature_indices.device
         assert weight.device == feature_indices.device
         assert bias.device == feature_indices.device
 
         assert feature_indices.is_contiguous()
-        assert feature_values.is_contiguous()
         assert weight.is_contiguous()
         assert bias.is_contiguous()
 
@@ -59,7 +52,6 @@ class SparseLinearFunction(autograd.Function):
             grid=(batch_size,),
             args=(
                 feature_indices.data_ptr(),
-                feature_values.data_ptr(),
                 weight.data_ptr(),
                 bias.data_ptr(),
                 output.data_ptr(),
@@ -69,13 +61,13 @@ class SparseLinearFunction(autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, *grad_outputs):
         assert not ctx.needs_input_grad[0]
-        assert not ctx.needs_input_grad[1]
 
+        (grad_output,) = grad_outputs
         grad_output = grad_output.contiguous()
 
-        feature_indices, feature_values, weight, bias = ctx.saved_tensors
+        feature_indices, weight, bias = ctx.saved_tensors
 
         device = feature_indices.device
         batch_size = feature_indices.shape[0]
@@ -94,11 +86,10 @@ class SparseLinearFunction(autograd.Function):
             grid=(batch_size,),
             args=(
                 feature_indices.data_ptr(),
-                feature_values.data_ptr(),
                 weight_grad.data_ptr(),
                 bias_grad.data_ptr(),
                 grad_output.data_ptr(),
             ),
         )
 
-        return None, None, weight_grad, bias_grad
+        return None, weight_grad, bias_grad

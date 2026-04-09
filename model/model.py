@@ -73,13 +73,11 @@ class NNUEModel(nn.Module):
         us: torch.Tensor,
         them: torch.Tensor,
         white_indices: torch.Tensor,
-        white_values: torch.Tensor,
         black_indices: torch.Tensor,
-        black_values: torch.Tensor,
         psqt_indices: torch.Tensor,
         layer_stack_indices: torch.Tensor,
     ):
-        wp, bp = self.input(white_indices, white_values, black_indices, black_values)
+        wp, bp = self.input(white_indices, black_indices)
         w, wpsqt = torch.split(wp, self.L1, dim=1)
         b, bpsqt = torch.split(bp, self.L1, dim=1)
         l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))

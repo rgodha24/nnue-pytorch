@@ -98,10 +98,10 @@ def profile_combined(filenames, num_batches=100):
     it = iter(loader)
     for _ in range(5):
         batch = next(it)
-        # model takes: us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices
-        # dataloader returns 10 tensors including outcome and score for loss computation
+        # model takes: us, them, white_indices, black_indices, psqt_indices, layer_stack_indices
+        # dataloader returns 8 tensors including outcome and score for loss computation
         batch_gpu = [b.cuda(non_blocking=True) for b in batch]
-        _ = model.model(*batch_gpu[:6], batch_gpu[8], batch_gpu[9])
+        _ = model.model(*batch_gpu[:4], batch_gpu[6], batch_gpu[7])
 
     torch.cuda.synchronize()
     print("  Starting benchmark...")
@@ -117,7 +117,7 @@ def profile_combined(filenames, num_batches=100):
         t1 = time.perf_counter()
 
         batch_gpu = [b.cuda(non_blocking=True) for b in batch]
-        _ = model.model(*batch_gpu[:6], batch_gpu[8], batch_gpu[9])
+        _ = model.model(*batch_gpu[:4], batch_gpu[6], batch_gpu[7])
         torch.cuda.synchronize()
         t2 = time.perf_counter()
 

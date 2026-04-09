@@ -51,11 +51,13 @@ class NNUE(L.LightningModule):
         # lazy init so `resume_from_model` with config changes works correctly
         self.optimizer_wrapper = None
 
-        self.loss_metrics = MetricCollection ({
-            "train_loss_epoch": MeanMetric(),
-            "val_loss_epoch": MeanMetric(),
-            "test_loss_epoch": MeanMetric(),
-        })
+        self.loss_metrics = MetricCollection(
+            {
+                "train_loss_epoch": MeanMetric(),
+                "val_loss_epoch": MeanMetric(),
+                "test_loss_epoch": MeanMetric(),
+            }
+        )
 
     # --- setup optimizers and training hooks ---
     def configure_optimizers(self):
@@ -186,9 +188,7 @@ class NNUE(L.LightningModule):
             us,
             them,
             white_indices,
-            white_values,
             black_indices,
-            black_values,
             outcome,
             score,
             psqt_indices,
@@ -200,9 +200,7 @@ class NNUE(L.LightningModule):
                 us,
                 them,
                 white_indices,
-                white_values,
                 black_indices,
-                black_values,
                 psqt_indices,
                 layer_stack_indices,
             )

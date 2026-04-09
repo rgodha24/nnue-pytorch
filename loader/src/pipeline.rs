@@ -11,7 +11,9 @@ use rand::{Rng, SeedableRng};
 use sfbinpack::chess::{color::Color, piece::Piece, piecetype::PieceType};
 use sfbinpack::{CompressedReaderError, CompressedTrainingDataEntryReader, TrainingDataEntry};
 
-use crate::feature_extraction::{encode_training_entry, FeatureSet, RowMetadata, SparseRow};
+use crate::feature_extraction::{
+    encode_training_entry_indices_only, FeatureSet, RowMetadata, SparseRow,
+};
 
 const VALUE_NONE: i16 = 32002;
 const MAX_SKIP_RATE: f64 = 10.0;
@@ -91,8 +93,6 @@ pub struct HostBatchSlab {
     score: Vec<f32>,
     white: Vec<i32>,
     black: Vec<i32>,
-    white_values: Vec<f32>,
-    black_values: Vec<f32>,
     psqt_indices: Vec<i32>,
     layer_stack_indices: Vec<i32>,
 }
@@ -361,8 +361,6 @@ impl HostBatchSlab {
             score: vec![0.0; batch_size],
             white: vec![-1; flat_size],
             black: vec![-1; flat_size],
-            white_values: vec![0.0; flat_size],
-            black_values: vec![0.0; flat_size],
             psqt_indices: vec![0; batch_size],
             layer_stack_indices: vec![0; batch_size],
         }
@@ -438,37 +436,22 @@ impl HostBatchSlab {
         &self.black[..self.size * self.max_active_features]
     }
 
-    pub fn white_values_row(&self, row: usize) -> &[f32] {
-        let start = row * self.max_active_features;
-        &self.white_values[start..start + self.max_active_features]
-    }
-
-    pub fn white_values_flat_slice(&self) -> &[f32] {
-        &self.white_values[..self.size * self.max_active_features]
-    }
-
-    pub fn black_values_row(&self, row: usize) -> &[f32] {
-        let start = row * self.max_active_features;
-        &self.black_values[start..start + self.max_active_features]
-    }
-
-    pub fn black_values_flat_slice(&self) -> &[f32] {
-        &self.black_values[..self.size * self.max_active_features]
-    }
-
     pub fn copy_row(&self, row: usize) -> SparseRow {
+        let white = self.white_row(row).to_vec();
+        let black = self.black_row(row).to_vec();
+
         SparseRow {
             num_inputs: self.num_inputs,
             max_active_features: self.max_active_features,
             is_white: self.is_white[row],
             outcome: self.outcome[row],
             score: self.score[row],
-            white_count: count_active_features(self.white_row(row)),
-            black_count: count_active_features(self.black_row(row)),
-            white: self.white_row(row).to_vec(),
-            black: self.black_row(row).to_vec(),
-            white_values: self.white_values_row(row).to_vec(),
-            black_values: self.black_values_row(row).to_vec(),
+            white_count: count_active_features(&white),
+            black_count: count_active_features(&black),
+            white_values: feature_values_from_indices(&white),
+            black_values: feature_values_from_indices(&black),
+            white,
+            black,
             psqt_indices: self.psqt_indices[row],
             layer_stack_indices: self.layer_stack_indices[row],
         }
@@ -478,13 +461,11 @@ impl HostBatchSlab {
         let row = self.size;
         let start = row * self.max_active_features;
         let end = start + self.max_active_features;
-        let metadata = encode_training_entry(
+        let metadata = encode_training_entry_indices_only(
             entry,
             feature_set,
             &mut self.white[start..end],
-            &mut self.white_values[start..end],
             &mut self.black[start..end],
-            &mut self.black_values[start..end],
         );
 
         self.write_metadata(row, metadata);
@@ -967,6 +948,13 @@ fn count_active_features(features: &[i32]) -> usize {
         .iter()
         .take_while(|&&feature| feature != -1)
         .count()
+}
+
+fn feature_values_from_indices(features: &[i32]) -> Vec<f32> {
+    features
+        .iter()
+        .map(|&feature| if feature == -1 { 0.0 } else { 1.0 })
+        .collect()
 }
 
 fn random_seed() -> u64 {

@@ -27,81 +27,29 @@ class SparseBatch(ctypes.Structure):
     ]
 
     def get_tensors(self, device):
-        white_values = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.white_values, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        black_values = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.black_values, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        white_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.white, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        black_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(
-                    self.black, shape=(self.size, self.max_active_features)
-                )
-            )
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        us = (
-            torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(self.size, 1)))
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
+        def as_tensor(ptr, shape, *, long_dtype=False):
+            tensor = torch.from_numpy(np.ctypeslib.as_array(ptr, shape=shape))
+            if long_dtype:
+                tensor = tensor.long()
+            if device == "cpu":
+                return tensor.clone()
+            return tensor.to(device=device, non_blocking=True)
+
+        white_indices = as_tensor(self.white, (self.size, self.max_active_features))
+        black_indices = as_tensor(self.black, (self.size, self.max_active_features))
+        us = as_tensor(self.is_white, (self.size, 1))
         them = 1.0 - us
-        outcome = (
-            torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1)))
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        score = (
-            torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1)))
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        psqt_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(self.psqt_indices, shape=(self.size,))
-            )
-            .long()
-            .pin_memory()
-            .to(device=device, non_blocking=True)
-        )
-        layer_stack_indices = (
-            torch.from_numpy(
-                np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))
-            )
-            .long()
-            .pin_memory()
-            .to(device=device, non_blocking=True)
+        outcome = as_tensor(self.outcome, (self.size, 1))
+        score = as_tensor(self.score, (self.size, 1))
+        psqt_indices = as_tensor(self.psqt_indices, (self.size,), long_dtype=True)
+        layer_stack_indices = as_tensor(
+            self.layer_stack_indices, (self.size,), long_dtype=True
         )
         return (
             us,
             them,
             white_indices,
-            white_values,
             black_indices,
-            black_values,
             outcome,
             score,
             psqt_indices,

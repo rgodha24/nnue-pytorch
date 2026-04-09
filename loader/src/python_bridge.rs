@@ -313,14 +313,6 @@ fn batch_to_pydict<'py>(py: Python<'py>, batch: &HostBatchSlab) -> PyResult<Boun
     let black = Array2::from_shape_vec((rows, cols), batch.black_flat_slice().to_vec())
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
         .into_pyarray(py);
-    let white_values =
-        Array2::from_shape_vec((rows, cols), batch.white_values_flat_slice().to_vec())
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-            .into_pyarray(py);
-    let black_values =
-        Array2::from_shape_vec((rows, cols), batch.black_values_flat_slice().to_vec())
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-            .into_pyarray(py);
     let psqt_indices = Array1::from_vec(batch.psqt_indices_slice().to_vec()).into_pyarray(py);
     let layer_stack_indices =
         Array1::from_vec(batch.layer_stack_indices_slice().to_vec()).into_pyarray(py);
@@ -342,8 +334,6 @@ fn batch_to_pydict<'py>(py: Python<'py>, batch: &HostBatchSlab) -> PyResult<Boun
     dict.set_item("score", score)?;
     dict.set_item("white", white)?;
     dict.set_item("black", black)?;
-    dict.set_item("white_values", white_values)?;
-    dict.set_item("black_values", black_values)?;
     dict.set_item("psqt_indices", psqt_indices)?;
     dict.set_item("layer_stack_indices", layer_stack_indices)?;
     Ok(dict)

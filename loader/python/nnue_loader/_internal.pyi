@@ -15,8 +15,6 @@ class Batch(TypedDict):
     score: npt.NDArray[np.float32]
     white: npt.NDArray[np.int32]
     black: npt.NDArray[np.int32]
-    white_values: npt.NDArray[np.float32]
-    black_values: npt.NDArray[np.float32]
     psqt_indices: npt.NDArray[np.int32]
     layer_stack_indices: npt.NDArray[np.int32]
 
