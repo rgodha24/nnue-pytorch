@@ -11,3 +11,4 @@ pgo_data/
 bench
 bench_*
 nnue-data/
+runs/
