@@ -34,6 +34,7 @@
 
             cudaPackages.cudatoolkit
             cudaPackages.cuda_nvrtc
+            cudaPackages.cuda_cudart
             cudaPackages.cudnn
             cudaPackages.libcublas
             cudaPackages.libcufft

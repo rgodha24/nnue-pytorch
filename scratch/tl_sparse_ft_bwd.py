@@ -44,6 +44,7 @@ from model.modules.feature_transformer.kernel import (
 
 # --- reference CuPy kernel --------------------------------------------------
 
+
 def run_cupy_reference(
     indices: torch.Tensor,
     values: torch.Tensor,
@@ -69,6 +70,7 @@ def run_cupy_reference(
 
 
 # --- torch index_add baseline ----------------------------------------------
+
 
 def run_torch_index_add(
     indices: torch.Tensor,
@@ -131,34 +133,27 @@ def _sparse_ft_backward_naive_factory(B, K, O, N_pad, threads, per_thread):
                 if idx != -1:
                     val = values[bx, k]
                     for p in T.serial(per_thread):
-                        T.atomic_add(
-                            weight_grad[idx, p * threads + tid], og[p] * val
-                        )
+                        T.atomic_add(weight_grad[idx, p * threads + tid], og[p] * val)
 
     return kernel
 
 
-def make_tl_sparse_ft_backward(
-    B: int, K: int, O: int, N_pad: int, threads: int = 256
-):
+def make_tl_sparse_ft_backward(B: int, K: int, O: int, N_pad: int, threads: int = 256):
     assert O % threads == 0, f"O={O} must be divisible by threads={threads}"
     key = ("naive", B, K, O, N_pad, threads)
     if key in _KERNEL_CACHE:
         return _KERNEL_CACHE[key]
     per_thread = O // threads
-    kernel = _sparse_ft_backward_naive_factory(
-        B, K, O, N_pad, threads, per_thread
-    )
+    kernel = _sparse_ft_backward_naive_factory(B, K, O, N_pad, threads, per_thread)
     _KERNEL_CACHE[key] = kernel
     return kernel
 
 
 # --- tilelang: sort-and-segment-reduce (pre-sort done in torch) ------------
 
+
 @tilelang.jit
-def _sparse_ft_backward_sorted_factory(
-    B, M, U, O, N_pad, threads, per_thread
-):
+def _sparse_ft_backward_sorted_factory(B, M, U, O, N_pad, threads, per_thread):
     """Sorted segment-reduce backward.
 
     Inputs (pre-computed in torch with one sort):
@@ -210,17 +205,19 @@ def _sparse_ft_backward_sorted_factory(
     return kernel
 
 
-def _build_sorted_inputs(indices: torch.Tensor, values: torch.Tensor):
+def _build_sorted_inputs(
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    flat_bid: torch.Tensor | None = None,
+):
     """Sort (indices, values) by feature id and return the segment tables."""
     B, K = indices.shape
     flat_idx = indices.reshape(-1)
     flat_val = values.reshape(-1)
-    flat_bid = (
-        torch.arange(B, device=indices.device, dtype=torch.int32)
-        .unsqueeze(1)
-        .expand(B, K)
-        .reshape(-1)
-    )
+    if flat_bid is None:
+        flat_bid = torch.arange(
+            B, device=indices.device, dtype=torch.int32
+        ).repeat_interleave(K)
     mask = flat_idx != -1
     flat_idx = flat_idx[mask]
     flat_val = flat_val[mask]
@@ -261,6 +258,7 @@ def make_tl_sorted_backward(B, M, U, O, N_pad, threads=256):
 
 
 # --- test + benchmark ------------------------------------------------------
+
 
 def make_fake_batch(
     B: int, K: int, N: int, O: int, device="cuda", hot_frac: float = 0.0
@@ -311,6 +309,9 @@ def main():
     # chosen from a ~64-element hot bucket.
     hot_frac = 1.0 / K
     indices, values, output_grad = make_fake_batch(B, K, N, O, hot_frac=hot_frac)
+    flat_bid_template = torch.arange(
+        B, device=indices.device, dtype=torch.int32
+    ).repeat_interleave(K)
     print(f"B={B} K={K} O={O} N={N}  hot_frac={hot_frac:.3f}")
 
     # Reference
@@ -340,7 +341,7 @@ def main():
         seg_feat,
         seg_count,
         seg_start,
-    ) = _build_sorted_inputs(indices, values)
+    ) = _build_sorted_inputs(indices, values, flat_bid_template)
     M = sorted_feat.numel()
     U = seg_feat.numel()
     print(f"sorted: M={M} U={U}  (max seg count={int(seg_count.max().item())})")
@@ -373,6 +374,13 @@ def main():
         tl_sorted(sf, sb, sv, output_grad, start, feat, count, wg)
         _ = output_grad.sum(dim=0)
 
+    def run_tl_sorted_full_cached_bid():
+        prepared = _build_sorted_inputs(indices, values, flat_bid_template)
+        sf, sb, sv, feat, count, start = prepared
+        wg = torch.zeros(N_pad, O, dtype=torch.float32, device="cuda")
+        tl_sorted(sf, sb, sv, output_grad, start, feat, count, wg)
+        _ = output_grad.sum(dim=0)
+
     def run_tl_sorted_kernel_only():
         # Just the reduce kernel with pre-built sorted inputs (realistic
         # upper bound if the sort is amortized across multiple backward
@@ -399,14 +407,26 @@ def main():
     torch_ms = bench(run_torch)
     tl_naive_ms = bench(run_tl_naive)
     tl_sorted_full_ms = bench(run_tl_sorted_full)
+    tl_sorted_full_cached_bid_ms = bench(run_tl_sorted_full_cached_bid)
     tl_sorted_kernel_ms = bench(run_tl_sorted_kernel_only)
 
     print()
-    print(f"cupy backward            : {cupy_ms*1000:7.1f} us")
-    print(f"torch index_add_         : {torch_ms*1000:7.1f} us  ({cupy_ms/torch_ms:.2f}x)")
-    print(f"tilelang naive           : {tl_naive_ms*1000:7.1f} us  ({cupy_ms/tl_naive_ms:.2f}x)")
-    print(f"tilelang sorted (full)   : {tl_sorted_full_ms*1000:7.1f} us  ({cupy_ms/tl_sorted_full_ms:.2f}x)")
-    print(f"tilelang sorted (kernel) : {tl_sorted_kernel_ms*1000:7.1f} us  ({cupy_ms/tl_sorted_kernel_ms:.2f}x)")
+    print(f"cupy backward            : {cupy_ms * 1000:7.1f} us")
+    print(
+        f"torch index_add_         : {torch_ms * 1000:7.1f} us  ({cupy_ms / torch_ms:.2f}x)"
+    )
+    print(
+        f"tilelang naive           : {tl_naive_ms * 1000:7.1f} us  ({cupy_ms / tl_naive_ms:.2f}x)"
+    )
+    print(
+        f"tilelang sorted (full)   : {tl_sorted_full_ms * 1000:7.1f} us  ({cupy_ms / tl_sorted_full_ms:.2f}x)"
+    )
+    print(
+        f"tilelang sorted (+cached row ids): {tl_sorted_full_cached_bid_ms * 1000:7.1f} us  ({cupy_ms / tl_sorted_full_cached_bid_ms:.2f}x)"
+    )
+    print(
+        f"tilelang sorted (kernel) : {tl_sorted_kernel_ms * 1000:7.1f} us  ({cupy_ms / tl_sorted_kernel_ms:.2f}x)"
+    )
 
 
 if __name__ == "__main__":
