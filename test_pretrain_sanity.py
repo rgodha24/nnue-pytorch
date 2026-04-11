@@ -3,15 +3,14 @@
 
 import sys
 import torch
-import lightning as L
 from torch.utils.data import DataLoader
 
 # Add repo to path
 sys.path.insert(0, "/home/hice1/rgodha3/nnue-pytorch")
 
 import data_loader
-import model as M
-from config import TrainingConfig
+from model.config import NNUELightningConfig
+from model.lightning_module import NNUE
 from data_loader.config import DataloaderSkipConfig
 
 print("=" * 60)
@@ -87,12 +86,8 @@ except Exception as e:
 # 5. Test model creation
 print("\n5. Testing model creation...")
 try:
-    nnue = M.NNUE(
-        num_inputs=768,
-        feature_set=M.FeatureSet.Full_Threats_HalfKAv2_hm,
-        layer_counts=(1024, 31),
-        activation_fn=M.ActivationFn.SCReLU,
-    )
+    config = NNUELightningConfig()
+    nnue = NNUE(config)
     print(
         f"✅ Model created: {sum(p.numel() for p in nnue.parameters()) / 1e6:.1f}M parameters"
     )
@@ -134,9 +129,12 @@ try:
 
     start = time.time()
     output = nnue(
-        (us, them),
-        (white_idx, white_val),
-        (black_idx, black_val),
+        us,
+        them,
+        white_idx,
+        white_val,
+        black_idx,
+        black_val,
         psqt_idx,
         layer_stack_idx,
     )
