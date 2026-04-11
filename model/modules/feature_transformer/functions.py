@@ -55,16 +55,7 @@ class SparseLinearFunction(autograd.Function):
         kernel = make_sparse_input_linear_forward_kernel(
             max_active_features, output_size
         )
-        kernel(
-            grid=(batch_size,),
-            args=(
-                feature_indices.data_ptr(),
-                feature_values.data_ptr(),
-                weight.data_ptr(),
-                bias.data_ptr(),
-                output.data_ptr(),
-            ),
-        )
+        kernel(feature_indices, feature_values, weight, bias, output)
 
         return output
 
@@ -75,10 +66,9 @@ class SparseLinearFunction(autograd.Function):
 
         grad_output = grad_output.contiguous()
 
-        feature_indices, feature_values, weight, bias = ctx.saved_tensors
+        feature_indices, feature_values, weight, _bias = ctx.saved_tensors
 
         device = feature_indices.device
-        batch_size = feature_indices.shape[0]
         max_active_features = feature_indices.shape[1]
         output_size = weight.shape[1]
 
@@ -90,15 +80,6 @@ class SparseLinearFunction(autograd.Function):
         kernel = make_sparse_input_linear_backward_kernel(
             max_active_features, output_size
         )
-        kernel(
-            grid=(batch_size,),
-            args=(
-                feature_indices.data_ptr(),
-                feature_values.data_ptr(),
-                weight_grad.data_ptr(),
-                bias_grad.data_ptr(),
-                grad_output.data_ptr(),
-            ),
-        )
+        kernel(feature_indices, feature_values, weight_grad, bias_grad, grad_output)
 
         return None, None, weight_grad, bias_grad

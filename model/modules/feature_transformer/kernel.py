@@ -1,5 +1,16 @@
-import cupy as cp
+from collections.abc import Callable
+
 import torch
+import tilelang
+import tilelang.language as T
+
+
+SparseInputLinearForwardKernel = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+]
+SparseInputLinearBackwardKernel = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None
+]
 
 
 def _find_nearest_divisor(value: int, target: int) -> int:
@@ -11,7 +22,7 @@ def _find_nearest_divisor(value: int, target: int) -> int:
     return divisors[0][0]
 
 
-_num_threads_forward_cache: dict[int, int] = dict()
+_num_threads_forward_cache: dict[int, int] = {}
 
 
 def _get_num_threads_for_forward(output_size: int) -> int:
@@ -24,7 +35,7 @@ def _get_num_threads_for_forward(output_size: int) -> int:
     return _num_threads_forward_cache[output_size]
 
 
-_num_threads_backward_cache: dict[int, int] = dict()
+_num_threads_backward_cache: dict[int, int] = {}
 
 
 def _get_num_threads_for_backward(output_size: int) -> int:
@@ -37,275 +48,231 @@ def _get_num_threads_for_backward(output_size: int) -> int:
     return _num_threads_backward_cache[output_size]
 
 
-def _kernel_with_threads(kernel, threads):
-    def f(grid, args):
-        kernel(grid=grid, block=threads, args=args)
-
-    return f
+_flat_batch_index_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
-_sparse_input_linear_forward_kernel_cache = dict()
+def _get_flat_batch_indices(
+    batch_size: int, max_active_indices: int, device: torch.device
+) -> torch.Tensor:
+    key = (
+        device.index if device.index is not None else -1,
+        batch_size,
+        max_active_indices,
+    )
+    if key not in _flat_batch_index_cache:
+        _flat_batch_index_cache[key] = torch.arange(
+            batch_size, device=device, dtype=torch.int32
+        ).repeat_interleave(max_active_indices)
+    return _flat_batch_index_cache[key]
+
+
+@tilelang.jit
+def _sparse_input_linear_forward_factory(
+    max_active_indices, output_size, threads, per_thread
+):
+    batch_size = T.dynamic("batch_size")
+    num_inputs = T.dynamic("num_inputs")
+
+    @T.prim_func
+    def kernel(
+        input_indices: T.Tensor((batch_size, max_active_indices), "int32"),
+        input_values: T.Tensor((batch_size, max_active_indices), "float32"),
+        weight: T.Tensor((num_inputs, output_size), "float32"),
+        bias: T.Tensor((output_size,), "float32"),
+        output: T.Tensor((batch_size, output_size), "float32"),
+    ):
+        _shape_capture = (
+            batch_size,
+            num_inputs,
+            max_active_indices,
+            output_size,
+            threads,
+            per_thread,
+        )
+        with T.Kernel(batch_size, threads=threads) as bx:
+            tid = T.get_thread_binding(0)
+            acc = T.alloc_fragment((per_thread,), "float32")
+
+            for p in T.serial(per_thread):
+                acc[p] = bias[p * threads + tid]
+
+            for k in T.serial(max_active_indices):
+                idx = input_indices[bx, k]
+                if idx != -1:
+                    val = input_values[bx, k]
+                    for p in T.serial(per_thread):
+                        acc[p] += weight[idx, p * threads + tid] * val
+
+            for p in T.serial(per_thread):
+                output[bx, p * threads + tid] = acc[p]
+
+    return kernel
+
+
+def _build_sorted_backward_inputs(
+    input_indices: torch.Tensor,
+    input_values: torch.Tensor,
+    flat_batch_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat_idx = input_indices.reshape(-1)
+    flat_val = input_values.reshape(-1)
+    mask = flat_idx != -1
+
+    flat_idx = flat_idx[mask]
+    if flat_idx.numel() == 0:
+        empty_i32 = torch.empty(0, dtype=torch.int32, device=input_indices.device)
+        empty_f32 = torch.empty(0, dtype=torch.float32, device=input_indices.device)
+        return empty_i32, empty_f32, empty_i32, empty_i32, empty_i32
+
+    flat_val = flat_val[mask]
+    flat_bid = flat_batch_indices[mask]
+
+    sorted_idx, perm = torch.sort(flat_idx, stable=True)
+    sorted_bid = flat_bid[perm]
+    sorted_val = flat_val[perm]
+
+    seg_feat, seg_count = torch.unique_consecutive(sorted_idx, return_counts=True)
+    seg_start = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64, device=input_indices.device),
+            torch.cumsum(seg_count, dim=0)[:-1],
+        ]
+    ).to(torch.int32)
+
+    return (
+        sorted_bid.to(torch.int32),
+        sorted_val.contiguous(),
+        seg_feat.to(torch.int32),
+        seg_count.to(torch.int32),
+        seg_start,
+    )
+
+
+@tilelang.jit
+def _sparse_input_linear_backward_factory(output_size, threads, per_thread):
+    batch_size = T.dynamic("batch_size")
+    nonzero_count = T.dynamic("nonzero_count")
+    unique_count = T.dynamic("unique_count")
+    num_inputs = T.dynamic("num_inputs")
+
+    @T.prim_func
+    def kernel(
+        sorted_bidx: T.Tensor((nonzero_count,), "int32"),
+        sorted_val: T.Tensor((nonzero_count,), "float32"),
+        output_grad: T.Tensor((batch_size, output_size), "float32"),
+        seg_start: T.Tensor((unique_count,), "int32"),
+        seg_feat: T.Tensor((unique_count,), "int32"),
+        seg_count: T.Tensor((unique_count,), "int32"),
+        weight_grad: T.Tensor((num_inputs, output_size), "float32"),
+    ):
+        _shape_capture = (
+            batch_size,
+            nonzero_count,
+            unique_count,
+            num_inputs,
+            output_size,
+            threads,
+            per_thread,
+        )
+        with T.Kernel(unique_count, threads=threads) as bu:
+            tid = T.get_thread_binding(0)
+            acc = T.alloc_fragment((per_thread,), "float32")
+
+            for p in T.serial(per_thread):
+                acc[p] = T.float32(0)
+
+            start = seg_start[bu]
+            count = seg_count[bu]
+            feat = seg_feat[bu]
+
+            for j in T.serial(count):
+                batch_idx = sorted_bidx[start + j]
+                value = sorted_val[start + j]
+                for p in T.serial(per_thread):
+                    acc[p] += output_grad[batch_idx, p * threads + tid] * value
+
+            for p in T.serial(per_thread):
+                weight_grad[feat, p * threads + tid] = (
+                    weight_grad[feat, p * threads + tid] + acc[p]
+                )
+
+    return kernel
+
+
+class _SortedSparseInputLinearBackwardKernel:
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __call__(
+        self,
+        input_indices: torch.Tensor,
+        input_values: torch.Tensor,
+        weight_grad: torch.Tensor,
+        bias_grad: torch.Tensor,
+        output_grad: torch.Tensor,
+    ) -> None:
+        flat_batch_indices = _get_flat_batch_indices(
+            input_indices.shape[0], input_indices.shape[1], input_indices.device
+        )
+        sorted_bidx, sorted_val, seg_feat, seg_count, seg_start = (
+            _build_sorted_backward_inputs(
+                input_indices, input_values, flat_batch_indices
+            )
+        )
+
+        bias_grad.add_(output_grad.sum(dim=0))
+        if seg_feat.numel() == 0:
+            return
+
+        self.kernel(
+            sorted_bidx,
+            sorted_val,
+            output_grad,
+            seg_start,
+            seg_feat,
+            seg_count,
+            weight_grad,
+        )
+
+
+_sparse_input_linear_forward_kernel_cache: dict[
+    tuple[int, int, int], SparseInputLinearForwardKernel
+] = {}
 
 
 @torch.compiler.disable(recursive=False)
-def make_sparse_input_linear_forward_kernel(max_active_indices: int, output_size: int):
-    """
-    @param: max_active_indices
-        The maximum number of indices that are non-zero
-        for a single position. This value determines
-        the shape of the inputs.
-        This value is of type uint32_t.
-
-    @param: output_size
-        The number of outputs. Must match the shape of weights
-        and biases.
-        This value is of type uint32.
-    """
+def make_sparse_input_linear_forward_kernel(
+    max_active_indices: int, output_size: int
+) -> SparseInputLinearForwardKernel:
     num_threads = _get_num_threads_for_forward(output_size)
-    output_thread_slice_size = output_size // num_threads
+    per_thread = output_size // num_threads
     key = (max_active_indices, output_size, num_threads)
     if key not in _sparse_input_linear_forward_kernel_cache:
-        kernel = cp.RawKernel(
-            r"""
-
-typedef unsigned int uint32_t;
-typedef int int32_t;
-
-extern "C" __global__
-
-/*
-    @assumptions:
-        The blocks must have dimensionality (BATCH_SIZE,)
-        The threads must have dimensionality (N,), where
-        N * output_thread_slice_size == output_size.
-
-    @param: input_indices
-        A matrix of shape (BATCH_SIZE, max_active_indices)
-        containing indices of active indices for each position
-        in a batch. Input index of -1 means that the slot is empty
-        and the weights will not be accumulated for it. Moreover
-        no further indices from this block will be considered.
-        The indices form an implicit matrix of shape
-        (BATCH_SIZE, NUM_INPUTS), where the first dimension index is
-        inferred from the memory location (BATCH_SIZE), and the
-        second dimension index is stored in the input_indices matrix.
-        The type for input indices is int32_t.
-
-    @param: input_values
-        A matrix of shape (BATCH_SIZE, max_active_indices)
-        containing the values (arity) of the corresponding
-        input index in input_indices.
-        The type for the input value (arity) is float32.
-
-    @param: weight
-        The weight matrix of shape (NUM_INPUTS, output_size).
-        Weights must be of type float32.
-
-    @param: bias
-        The bias vector of shape (output_size,).
-        Bias values must be of type float32.
-
-    @param: output
-        An output matrix of shape (BATCH_SIZE, output_size).
-        It may not be initialized, bias is always copied
-        to the output first.
-        Output values must have type float32.
-*/
-void sparse_input_linear_forward(
-    const int32_t* const input_indices,
-    const float*   const input_values,
-    const float*   const weight,
-    const float*   const bias,
-          float*   const output
-) {{
-    __shared__
-          float          shared_output[{output_size}];
-
-    const uint32_t       block_idx           = blockIdx.x;
-    const uint32_t       slice_offset        = threadIdx.x * {output_thread_slice_size};
-
-          float*   const output_slice        = output + block_idx * {output_size} + slice_offset;
-    const float*   const bias_slice          = bias                               + slice_offset;
-          float*         shared_output_slice = shared_output                      + slice_offset;
-
-    const int32_t* const input_index_row     = input_indices + block_idx * {max_active_indices};
-    const float*   const input_value_row     = input_values  + block_idx * {max_active_indices};
-
-    #pragma unroll
-    for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
-    {{
-        shared_output_slice[s] = bias_slice[s];
-    }}
-
-    for (uint32_t k = 0; k < {max_active_indices}; ++k)
-    {{
-        const int32_t input_index = input_index_row[k];
-        const float   input_value = input_value_row[k];
-        if (input_index != -1)
-        {{
-            const float* const weight_slice = weight + input_index * {output_size} + slice_offset;
-            #pragma unroll
-            for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
-            {{
-                shared_output_slice[s] += weight_slice[s] * input_value;
-            }}
-        }} else break;
-    }}
-
-    #pragma unroll
-    for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
-    {{
-        output_slice[s] = shared_output_slice[s];
-    }}
-}}
-
-""".format(
-                max_active_indices=max_active_indices,
-                output_thread_slice_size=output_thread_slice_size,
-                output_size=output_size,
-            ),
-            "sparse_input_linear_forward",
-        )
-        kernel.compile()
-        _sparse_input_linear_forward_kernel_cache[key] = _kernel_with_threads(
-            kernel, (num_threads,)
+        _sparse_input_linear_forward_kernel_cache[key] = (
+            _sparse_input_linear_forward_factory(
+                max_active_indices, output_size, num_threads, per_thread
+            )
         )
     return _sparse_input_linear_forward_kernel_cache[key]
 
 
-_sparse_input_linear_backward_kernel_cache = dict()
+_sparse_input_linear_backward_kernel_cache: dict[
+    tuple[int, int, int], SparseInputLinearBackwardKernel
+] = {}
 
 
 @torch.compiler.disable(recursive=False)
-def make_sparse_input_linear_backward_kernel(max_active_indices: int, output_size: int):
-    """
-    @param: max_active_indices
-        The maximum number of indices that are non-zero for
-        a single position. This value determines the shape
-        of the inputs.
-        This value is of type uint32_t.
-
-    @param: output_size
-        The number of outputs. Must match the shape of weights
-        and biases.
-        This value is of type uint32.
-    """
+def make_sparse_input_linear_backward_kernel(
+    max_active_indices: int, output_size: int
+) -> SparseInputLinearBackwardKernel:
     num_threads = _get_num_threads_for_backward(output_size)
-    output_thread_slice_size = output_size // num_threads
+    per_thread = output_size // num_threads
     key = (max_active_indices, output_size, num_threads)
     if key not in _sparse_input_linear_backward_kernel_cache:
-        kernel = cp.RawKernel(
-            r"""
-
-typedef unsigned int uint32_t;
-typedef int int32_t;
-
-extern "C" __global__
-/*
-    @assumptions:
-        The blocks must have dimensionality (BATCH_SIZE,)
-        The threads must have dimensionality (N,), where
-        N * output_thread_slice_size == output_size.
-
-    @param: input_indices
-        A matrix of shape (BATCH_SIZE, max_active_indices)
-        containing indices of active indices for each position
-        in a batch. Input index of -1 means that the slot is empty
-        and the weights will not be accumulated for it. Moreover
-        no further indices from this block will be considered.
-        The indices form an implicit matrix of shape
-        (BATCH_SIZE, NUM_INPUTS), where the first dimension index is
-        inferred from the memory location (BATCH_SIZE), and the
-        second dimension index is stored in the input_indices matrix.
-        The type for input indices is int32_t.
-
-    @param: input_values
-        A matrix of shape (BATCH_SIZE, max_active_indices)
-        containing the values (arity) of the corresponding
-        input index in input_indices.
-        The type for the input value (arity) is float32.
-
-    @param: weight_grad
-        The weight gradient matrix of shape (NUM_INPUTS, output_size).
-        The gradient is accumulated, i.e. it must be zero initialized
-        on the first call.
-        Weights must be of type float32.
-
-    @param: bias_grad
-        The bias gradient vector of shape (output_size,).
-        The gradient is accumulated, i.e. it must be zero initialized
-        on the first call.
-        Bias values must be of type float32.
-
-    @param: output_grad
-        An output gradient matrix of shape (BATCH_SIZE, output_size).
-        Output values must have type float32.
-*/
-void sparse_input_linear_backward(
-    const int32_t* const input_indices,
-    const float*   const input_values,
-          float*   const weight_grad,
-          float*   const bias_grad,
-    const float*   const output_grad
-) {{
-    __shared__
-          float          shared_output_grad[{output_size}];
-
-    const uint32_t       block_idx                = blockIdx.x;
-    const uint32_t       slice_offset             = threadIdx.x * {output_thread_slice_size};
-
-    const float*   const output_grad_slice        = output_grad + block_idx * {output_size} + slice_offset;
-          float*   const bias_grad_slice          = bias_grad                               + slice_offset;
-          float*         shared_output_grad_slice = shared_output_grad                      + slice_offset;
-
-    const int32_t* const input_index_row          = input_indices + block_idx * {max_active_indices};
-    const float*   const input_value_row          = input_values  + block_idx * {max_active_indices};
-
-    #pragma unroll
-    for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
-    {{
-        shared_output_grad_slice[s] = output_grad_slice[s];
-    }}
-
-    #pragma unroll
-    for (uint32_t s = 0; s < {output_thread_slice_size}; ++s)
-    {{
-        const float sog = shared_output_grad_slice[s];
-        if (sog != 0.0f)
-        {{
-            atomicAdd(&bias_grad_slice[s], sog);
-        }}
-    }}
-
-    for (uint32_t k = 0; k < {max_active_indices}; ++k)
-    {{
-        const int32_t input_index = input_index_row[k];
-        const float   input_value = input_value_row[k];
-        if (input_index != -1)
-        {{
-            float* const weight_grad_slice = weight_grad + input_index * {output_size} + slice_offset;
-            #pragma unroll
-            for (int s = 0; s < {output_thread_slice_size}; ++s)
-            {{
-                const float sog = shared_output_grad_slice[s];
-                if (sog != 0.0f)
-                {{
-                    atomicAdd(&weight_grad_slice[s], sog * input_value);
-                }}
-            }}
-        }} else break;
-    }}
-}}
-
-""".format(
-                max_active_indices=max_active_indices,
-                output_thread_slice_size=output_thread_slice_size,
-                output_size=output_size,
-            ),
-            "sparse_input_linear_backward",
+        kernel = _sparse_input_linear_backward_factory(
+            output_size, num_threads, per_thread
         )
-        kernel.compile()
-        _sparse_input_linear_backward_kernel_cache[key] = _kernel_with_threads(
-            kernel, (num_threads,)
+        _sparse_input_linear_backward_kernel_cache[key] = (
+            _SortedSparseInputLinearBackwardKernel(kernel)
         )
     return _sparse_input_linear_backward_kernel_cache[key]

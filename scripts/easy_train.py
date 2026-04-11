@@ -211,14 +211,14 @@ def validate_pytorchlightning():
         return False
 
 
-def validate_cupy():
-    pkg = PackageInfo("cupy")
+def validate_tilelang():
+    pkg = PackageInfo("tilelang")
     if pkg.exists:
-        LOGGER.info(f"Found cupy version {pkg.version}. OK.")
+        LOGGER.info(f"Found tilelang version {pkg.version}. OK.")
         return True
     else:
         LOGGER.error(
-            "No cupy found. Install cupy matching cuda version used by pytorch. See https://cupy.dev/. Exiting."
+            "No tilelang found. Install the pinned tilelang package before training. Exiting."
         )
         return False
 
@@ -241,7 +241,7 @@ def validate_imports():
     success &= validate_asciimatics()
     success &= validate_pytorch()
     success &= validate_pytorchlightning()
-    success &= validate_cupy()
+    success &= validate_tilelang()
     success &= validate_gputil()
     return success
 
