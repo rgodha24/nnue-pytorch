@@ -213,7 +213,10 @@ class RustSparseBatchProvider:
             or config.wld_filtered
             or config.random_fen_skipping > 0
             or config.early_fen_skipping >= 0
-            or (config.simple_eval_skipping is not None and config.simple_eval_skipping > 0)
+            or (
+                config.simple_eval_skipping is not None
+                and config.simple_eval_skipping > 0
+            )
         )
 
         if skip_heavy:
@@ -236,6 +239,7 @@ class RustSparseBatchProvider:
             feature_set.replace("^", ""),
             list(filenames),
             batch_size,
+            total_threads=total_threads,
             decode_threads=decode_threads,
             encode_threads=encode_threads,
             slab_count=slab_count,

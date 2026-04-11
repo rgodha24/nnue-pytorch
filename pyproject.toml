@@ -19,7 +19,7 @@ dependencies = [
   "ranger21",
   "schedulefree",
   "cupy-cuda12x<14",
-  "tilelang==0.1.7.post3",
+  "tilelang==0.1.8",
 ]
 
 [tool.uv.sources]

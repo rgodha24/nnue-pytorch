@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -87,6 +87,7 @@ pub struct BatchPipeline {
     error: Mutex<Option<PipelineError>>,
     stats: Arc<PipelineCounters>,
     workers: Vec<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 pub struct PooledBatch {
@@ -294,6 +295,7 @@ impl BatchPipeline {
 
         let files = Arc::new(config.files.clone());
         let chunk_scheduler = Arc::new(ChunkScheduler::new(scanned_chunks, config.cyclic));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(decode_threads + encode_threads);
 
         for thread_index in 0..decode_threads {
@@ -303,6 +305,7 @@ impl BatchPipeline {
             let error_tx = error_tx.clone();
             let thread_config = config.clone();
             let stats = Arc::clone(&stats);
+            let shutdown = Arc::clone(&shutdown);
             workers.push(thread::spawn(move || {
                 decoder_worker(
                     thread_index,
@@ -312,6 +315,7 @@ impl BatchPipeline {
                     decoded_tx,
                     error_tx,
                     stats,
+                    shutdown,
                 )
             }));
         }
@@ -323,6 +327,7 @@ impl BatchPipeline {
             let ready_tx = ready_tx.clone();
             let free_rx = free_rx.clone();
             let stats = Arc::clone(&stats);
+            let shutdown = Arc::clone(&shutdown);
             workers.push(thread::spawn(move || {
                 encoder_worker(
                     thread_index,
@@ -331,6 +336,7 @@ impl BatchPipeline {
                     ready_tx,
                     free_rx,
                     stats,
+                    shutdown,
                 )
             }));
         }
@@ -343,6 +349,7 @@ impl BatchPipeline {
             error: Mutex::new(None),
             stats,
             workers,
+            shutdown,
         })
     }
 
@@ -407,6 +414,9 @@ impl BatchPipeline {
 
 impl Drop for BatchPipeline {
     fn drop(&mut self) {
+        // Signal workers to exit even if batches are still alive in Python
+        self.shutdown.store(true, Ordering::Relaxed);
+
         self.ready_rx.take();
         self.free_tx.take();
         self.error_rx.take();
@@ -435,7 +445,10 @@ impl Drop for PooledBatch {
     fn drop(&mut self) {
         if let Some(mut slab) = self.slab.take() {
             slab.reset();
-            let _ = self.free_tx.send(slab);
+            // Use try_send with 0 timeout to avoid blocking if channel is disconnected
+            // This can happen when the pipeline is shutting down but batches are still
+            // being dropped by Python's GC
+            let _ = self.free_tx.try_send(slab);
         }
     }
 }
@@ -705,6 +718,7 @@ fn decoder_worker(
     decoded_tx: Sender<Vec<TrainingDataEntry>>,
     error_tx: Sender<String>,
     stats: Arc<PipelineCounters>,
+    shutdown: Arc<AtomicBool>,
 ) {
     if chunk_scheduler.task_count() == 0 {
         return;
@@ -776,7 +790,8 @@ fn decoder_worker(
             }
 
             if accumulation.len() >= config.accumulation_entries
-                && publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx).is_err()
+                && publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx, &shutdown)
+                    .is_err()
             {
                 flush_decoder_counters(&mut counters, &stats);
                 return;
@@ -789,7 +804,7 @@ fn decoder_worker(
     while let Some(entry) = pop_shuffled_entry(&mut shuffle_buffer, &mut rng) {
         accumulation.push(entry);
         if accumulation.len() >= config.accumulation_entries
-            && publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx).is_err()
+            && publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx, &shutdown).is_err()
         {
             flush_decoder_counters(&mut counters, &stats);
             return;
@@ -798,7 +813,7 @@ fn decoder_worker(
 
     flush_decoder_counters(&mut counters, &stats);
     if !accumulation.is_empty() {
-        let _ = publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx);
+        let _ = publish_decoded_chunk(&decoded_tx, &mut accumulation, &error_tx, &shutdown);
     }
 }
 
@@ -806,6 +821,7 @@ fn publish_decoded_chunk(
     decoded_tx: &Sender<Vec<TrainingDataEntry>>,
     accumulation: &mut Vec<TrainingDataEntry>,
     error_tx: &Sender<String>,
+    shutdown: &Arc<AtomicBool>,
 ) -> Result<(), ()> {
     if accumulation.is_empty() {
         return Ok(());
@@ -813,11 +829,23 @@ fn publish_decoded_chunk(
 
     let mut chunk = Vec::with_capacity(accumulation.len());
     std::mem::swap(accumulation, &mut chunk);
-    match decoded_tx.send(chunk) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            report_error(error_tx, "decoded channel closed unexpectedly".to_string());
-            Err(())
+
+    // Use try_send with timeout loop to check shutdown flag
+    // This prevents decoders from blocking forever when encoders are stuck
+    loop {
+        match decoded_tx.try_send(chunk) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(c)) => {
+                chunk = c;
+                if shutdown.load(Ordering::Relaxed) {
+                    return Err(());
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                report_error(error_tx, "decoded channel closed unexpectedly".to_string());
+                return Err(());
+            }
         }
     }
 }
@@ -840,6 +868,7 @@ fn encoder_worker(
     ready_tx: Sender<HostBatchSlab>,
     free_rx: Receiver<HostBatchSlab>,
     stats: Arc<PipelineCounters>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut current_slab: Option<HostBatchSlab> = None;
     let mut counters = EncoderWorkerCounters::default();
@@ -847,10 +876,23 @@ fn encoder_worker(
     while let Ok(entries) = decoded_rx.recv() {
         for entry in entries {
             if current_slab.is_none() {
-                current_slab = free_rx.recv().ok();
-                if current_slab.is_none() {
-                    flush_encoder_counters(&mut counters, &stats);
-                    return;
+                loop {
+                    match free_rx.recv_timeout(POLL_INTERVAL) {
+                        Ok(slab) => {
+                            current_slab = Some(slab);
+                            break;
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if shutdown.load(Ordering::Relaxed) {
+                                flush_encoder_counters(&mut counters, &stats);
+                                return;
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            flush_encoder_counters(&mut counters, &stats);
+                            return;
+                        }
+                    }
                 }
             }
 
