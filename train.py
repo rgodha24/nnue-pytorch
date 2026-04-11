@@ -16,6 +16,7 @@ import model as M
 import tyro
 
 from config import TrainingConfig
+from data_loader.config import DataloaderDDPConfig
 
 warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
@@ -41,6 +42,7 @@ class TimeLimitAfterCheckpoint(Callback):
             print(
                 f"[TimeLimit] Time limit reached ({elapsed:.1f}s), stopping after checkpoint."
             )
+
 
 class SimpleLineLogger(Callback):
     def __init__(
@@ -84,7 +86,7 @@ class SimpleLineLogger(Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
             self.train_start_time = time.time()
-            print("-"*60)
+            print("-" * 60)
 
     @torch.compiler.disable
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -94,13 +96,18 @@ class SimpleLineLogger(Callback):
         current_step = batch_idx + 1
         total_batches = trainer.num_training_batches
 
-        if current_step % self._get_refresh_rate(trainer) == 0 or current_step == total_batches:
+        if (
+            current_step % self._get_refresh_rate(trainer) == 0
+            or current_step == total_batches
+        ):
             now = time.time()
             elapsed_total = now - self.train_start_time
             rate = current_step / elapsed_total if elapsed_total > 0 else 0
 
             remaining = (total_batches - current_step) / rate if rate > 0 else 0
-            loss_val = trainer.callback_metrics.get(self.train_metric_step, float('nan'))
+            loss_val = trainer.callback_metrics.get(
+                self.train_metric_step, float("nan")
+            )
 
             print(
                 f"Epoch {trainer.current_epoch:>2} (Train): "
@@ -122,11 +129,11 @@ class SimpleLineLogger(Callback):
             return
 
         pl_module._log_epoch_end(self.train_metric_epoch)
-        train_loss = trainer.callback_metrics.get(self.train_metric_epoch, float('nan'))
+        train_loss = trainer.callback_metrics.get(self.train_metric_epoch, float("nan"))
         print(
             f"Epoch {trainer.current_epoch:>2} (Train): "
             f"[{self.train_metric_epoch}={train_loss:.5f}]",
-            flush=True
+            flush=True,
         )
 
     # ==========================================
@@ -138,7 +145,9 @@ class SimpleLineLogger(Callback):
             self.val_start_time = time.time()
 
     @torch.compiler.disable
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+    def on_validation_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
         if trainer.global_rank != 0 or trainer.sanity_checking:
             return
 
@@ -149,7 +158,10 @@ class SimpleLineLogger(Callback):
         else:
             total_batches = sum(val_batches)
 
-        if current_step % self._get_refresh_rate(trainer) == 0 or current_step == total_batches:
+        if (
+            current_step % self._get_refresh_rate(trainer) == 0
+            or current_step == total_batches
+        ):
             now = time.time()
             elapsed_total = now - self.val_start_time
 
@@ -171,11 +183,11 @@ class SimpleLineLogger(Callback):
             return
 
         pl_module._log_epoch_end(self.val_metric)
-        val_loss = trainer.callback_metrics.get(self.val_metric, float('nan'))
+        val_loss = trainer.callback_metrics.get(self.val_metric, float("nan"))
         print(
             f"Epoch {trainer.current_epoch:>2} (Val): "
             f"[{self.val_metric}={val_loss:.5f}]",
-            flush=True
+            flush=True,
         )
 
 
@@ -185,27 +197,31 @@ def make_data_loaders(
     feature_name: str,
     num_workers,
     batch_size,
+    global_batch_size,
     config: data_loader.DataloaderSkipConfig,
     epoch_size,
     val_size,
     pin_memory,
     queue_size_limit,
+    ddp_config: DataloaderDDPConfig | None = None,
 ):
     # Epoch and validation sizes are arbitrary
     features_name = feature_name
+    train_num_batches = num_batches_for_size(epoch_size, global_batch_size)
     train_infinite = data_loader.SparseBatchDataset(
         features_name,
         train_filenames,
         batch_size,
         num_workers=num_workers,
         config=config,
+        ddp_config=ddp_config,
     )
     # num_workers has to be 0 for sparse, and 1 for dense
     # it currently cannot work in parallel mode but it shouldn't need to
     train = DataLoader(
         data_loader.FixedNumBatchesDataset(
             train_infinite,
-            (epoch_size + batch_size - 1) // batch_size,
+            train_num_batches,
             pin_memory=pin_memory,
             queue_size_limit=queue_size_limit,
         ),
@@ -219,7 +235,7 @@ def make_data_loaders(
         val = DataLoader(
             data_loader.FixedNumBatchesDataset(
                 train_infinite,
-                (val_size + batch_size - 1) // batch_size,
+                num_batches_for_size(val_size, global_batch_size),
                 pin_memory=pin_memory,
                 queue_size_limit=queue_size_limit,
             ),
@@ -233,11 +249,12 @@ def make_data_loaders(
             val_filenames,
             batch_size,
             config=config,
+            ddp_config=ddp_config,
         )
         val = DataLoader(
             data_loader.FixedNumBatchesDataset(
                 val_infinite,
-                (val_size + batch_size - 1) // batch_size,
+                num_batches_for_size(val_size, global_batch_size),
                 pin_memory=pin_memory,
                 queue_size_limit=queue_size_limit,
             ),
@@ -251,6 +268,24 @@ def make_data_loaders(
 def is_master_process():
     # torchrun sets 'RANK'. If not set, we assume it's a single-process run (Rank 0).
     return int(os.environ.get("RANK", 0)) == 0
+
+
+def num_batches_for_size(total_positions: int, global_batch_size: int) -> int:
+    if total_positions <= 0:
+        return 0
+    return max(1, (total_positions + global_batch_size - 1) // global_batch_size)
+
+
+def resolve_dataloader_ddp_config(n_devices: int) -> DataloaderDDPConfig:
+    world_size = int(os.environ.get("WORLD_SIZE", n_devices if n_devices > 1 else 1))
+    rank = int(os.environ.get("RANK", 0))
+
+    if world_size <= 0:
+        raise ValueError(f"Invalid WORLD_SIZE={world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"Invalid RANK={rank} for WORLD_SIZE={world_size}")
+
+    return DataloaderDDPConfig(rank=rank, world_size=world_size)
 
 
 def main():
@@ -313,12 +348,16 @@ def main():
             file=sys.stderr,
         )
         return
-    if global_batch_size_requested % n_devices != 0:
+    ddp_config = resolve_dataloader_ddp_config(n_devices)
+    if global_batch_size_requested % ddp_config.world_size != 0:
         raise ValueError(
-            f"--batch-size {global_batch_size_requested} must be divisible by number of gpus ({n_devices}). "
-            f"Got --gpus={args.gpus or '0'}"
+            f"--batch-size {global_batch_size_requested} must be divisible by DDP world size ({ddp_config.world_size}). "
+            f"Got --gpus={args.gpus or '0'} and WORLD_SIZE={ddp_config.world_size}"
         )
-    per_gpu_batch_size = global_batch_size_requested // n_devices
+    per_rank_batch_size = global_batch_size_requested // ddp_config.world_size
+    num_batches_per_epoch = num_batches_for_size(
+        args.epoch_size, global_batch_size_requested
+    )
     feature_name = args.nnue_lightning_config.features
 
     max_epoch = args.max_epochs or 800
@@ -326,7 +365,7 @@ def main():
         nnue = M.NNUE(
             config=args.nnue_lightning_config,
             max_epoch=max_epoch,
-            num_batches_per_epoch=args.num_batches_per_epoch,
+            num_batches_per_epoch=num_batches_per_epoch,
             param_index=args.dataloader_config.param_index,
             quantize_config=M.QuantizationConfig(),
         )
@@ -343,7 +382,7 @@ def main():
         # we can set the following here just like that because when resuming
         # from .pt the optimizer is only created after the training is started
         nnue.max_epoch = max_epoch
-        nnue.num_batches_per_epoch = args.num_batches_per_epoch
+        nnue.num_batches_per_epoch = num_batches_per_epoch
         nnue.config = args.nnue_lightning_config
         nnue.param_index = args.dataloader_config.param_index
 
@@ -358,7 +397,7 @@ def main():
 
     if is_master_process():
         print(
-            f"batch_size(global)={global_batch_size_requested} | n_devices={n_devices} | batch_size(per_gpu)={per_gpu_batch_size}"
+            f"batch_size(global)={global_batch_size_requested} | world_size={ddp_config.world_size} | n_devices(local)={n_devices} | batch_size(per_rank)={per_rank_batch_size}"
         )
         print("Loss parameters:")
         print(loss_params)
@@ -395,20 +434,22 @@ def main():
         val_datasets,
         input_feature_name,
         actual_workers,
-        per_gpu_batch_size,
+        per_rank_batch_size,
+        global_batch_size_requested,
         args.dataloader_config,
         args.epoch_size,
         args.validation_size,
         pin_memory=args.pin_memory,
         queue_size_limit=args.data_loader_queue_size,
+        ddp_config=ddp_config,
     )
 
-    refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
+    refresh_rate = max(1, (num_batches_per_epoch + 4) // 5)
     trainer = L.Trainer(
         default_root_dir=logdir,
         max_epochs=args.max_epochs,
         accelerator="cuda",
-        strategy="ddp" if len(devices) > 1 else "auto",
+        strategy="ddp" if ddp_config.world_size > 1 else "auto",
         devices=devices,
         logger=loggers,
         callbacks=[
