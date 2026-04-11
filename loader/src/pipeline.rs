@@ -1,5 +1,7 @@
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1018,6 +1020,34 @@ fn scan_chunk_tasks(
         .collect())
 }
 
+fn read_chunk_header_at(
+    file: &mut File,
+    offset: u64,
+    header: &mut [u8; BINPACK_HEADER_SIZE],
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut filled = 0;
+        while filled < header.len() {
+            let read = file.read_at(&mut header[filled..], offset + filled as u64)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading binpack chunk header",
+                ));
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(header)
+    }
+}
+
 fn scan_file_chunk_tasks(
     path: &PathBuf,
     file_index: usize,
@@ -1039,7 +1069,10 @@ fn scan_file_chunk_tasks(
     let mut offset = 0u64;
 
     while offset < file_len {
-        file.read_exact(&mut header).map_err(|error| {
+        // Use positioned reads during the upfront scan so the kernel does not
+        // treat it like a sequential stream and pull chunk payloads into cache
+        // even though we only need the 8-byte headers.
+        read_chunk_header_at(&mut file, offset, &mut header).map_err(|error| {
             PipelineError::new(format!(
                 "failed to read chunk header from {} at offset {}: {error}",
                 path.display(),
@@ -1079,13 +1112,6 @@ fn scan_file_chunk_tasks(
             size,
         });
 
-        file.seek(SeekFrom::Current(size as i64)).map_err(|error| {
-            PipelineError::new(format!(
-                "failed to skip chunk payload in {} at offset {}: {error}",
-                path.display(),
-                offset
-            ))
-        })?;
         offset = next_offset;
     }
 
