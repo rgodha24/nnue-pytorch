@@ -3,7 +3,12 @@ from typing import Generator
 import torch
 from torch import nn
 
-from .stacked_linear import FactorizedStackedLinear, StackedLinear
+from .stacked_linear import (
+    FactorizedSharedLinear,
+    FactorizedStackedLinear,
+    SharedLinear,
+    StackedLinear,
+)
 from .config import LayerStacksConfig
 
 
@@ -15,14 +20,20 @@ class LayerStacks(nn.Module):
         self.L1 = config.L1
         self.L2 = config.L2
         self.L3 = config.L3
+        self.use_layer_stacks = config.layer_stacks
 
         # Factorizer only for the first layer because later
         # there's a non-linearity and factorization breaks.
         # This is by design. The weights in the further layers should be
         # able to diverge a lot.
-        self.l1 = FactorizedStackedLinear(2 * self.L1 // 2, self.L2 + 1, count)
-        self.l2 = StackedLinear(self.L2 * 2, self.L3, count)
-        self.output = StackedLinear(self.L3, 1, count)
+        if self.use_layer_stacks:
+            self.l1 = FactorizedStackedLinear(2 * self.L1 // 2, self.L2 + 1, count)
+            self.l2 = StackedLinear(self.L2 * 2, self.L3, count)
+            self.output = StackedLinear(self.L3, 1, count)
+        else:
+            self.l1 = FactorizedSharedLinear(2 * self.L1 // 2, self.L2 + 1, count)
+            self.l2 = SharedLinear(self.L2 * 2, self.L3, count)
+            self.output = SharedLinear(self.L3, 1, count)
 
         with torch.no_grad():
             self.output.linear.bias.zero_()

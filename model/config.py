@@ -25,12 +25,20 @@ class ModelConfig(LayerStacksConfig):
             type=int,
             default=ModelConfig.L2,
         )
+        parser.add_argument(
+            "--no-layer-stacks",
+            dest="layer_stacks",
+            action="store_false",
+            default=ModelConfig.layer_stacks,
+            help="Use a single shared dense stack across all buckets.",
+        )
 
     @staticmethod
     def get_model_config(args) -> "ModelConfig":
         config = ModelConfig()
         config.L1 = args.L1
         config.L2 = args.L2
+        config.layer_stacks = args.layer_stacks
         return config
 
 

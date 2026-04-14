@@ -3,6 +3,14 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def _copy_linear(linear: nn.Linear) -> nn.Linear:
+    layer = nn.Linear(linear.in_features, linear.out_features)
+    with torch.no_grad():
+        layer.weight.copy_(linear.weight)
+        layer.bias.copy_(linear.bias)
+    return layer
+
+
 class StackedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, count: int):
         super().__init__()
@@ -57,6 +65,25 @@ class StackedLinear(nn.Module):
         return layer
 
 
+class SharedLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, count: int):
+        super().__init__()
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.count = count
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x: torch.Tensor, ls_indices: torch.Tensor) -> torch.Tensor:
+        _ = ls_indices
+        return self.linear(x)
+
+    @torch.no_grad()
+    def at_index(self, index: int) -> nn.Linear:
+        _ = index
+        return _copy_linear(self.linear)
+
+
 class FactorizedStackedLinear(StackedLinear):
     def __init__(self, in_features: int, out_features: int, count: int):
         super().__init__(in_features, out_features, count)
@@ -95,5 +122,38 @@ class FactorizedStackedLinear(StackedLinear):
             self.linear.weight[begin:end, :].add_(self.factorized_linear.weight)
             self.linear.bias[begin:end].add_(self.factorized_linear.bias)
 
+        self.factorized_linear.weight.zero_()
+        self.factorized_linear.bias.zero_()
+
+
+class FactorizedSharedLinear(SharedLinear):
+    def __init__(self, in_features: int, out_features: int, count: int):
+        super().__init__(in_features, out_features, count)
+
+        self.factorized_linear = nn.Linear(in_features, out_features)
+
+        with torch.no_grad():
+            self.factorized_linear.weight.zero_()
+            self.factorized_linear.bias.zero_()
+
+    def forward(self, x: torch.Tensor, ls_indices: torch.Tensor) -> torch.Tensor:
+        _ = ls_indices
+        merged_weight = self.linear.weight + self.factorized_linear.weight
+        merged_bias = self.linear.bias + self.factorized_linear.bias
+        return F.linear(x, merged_weight, merged_bias)
+
+    @torch.no_grad()
+    def at_index(self, index: int) -> nn.Linear:
+        layer = super().at_index(index)
+
+        layer.weight.add_(self.factorized_linear.weight)
+        layer.bias.add_(self.factorized_linear.bias)
+
+        return layer
+
+    @torch.no_grad()
+    def coalesce_weights(self) -> None:
+        self.linear.weight.add_(self.factorized_linear.weight)
+        self.linear.bias.add_(self.factorized_linear.bias)
         self.factorized_linear.weight.zero_()
         self.factorized_linear.bias.zero_()

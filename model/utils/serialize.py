@@ -1,7 +1,7 @@
 from functools import reduce
 import operator
 import struct
-from typing import BinaryIO, Sequence
+from typing import Any, BinaryIO, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -93,20 +93,21 @@ class NNUEWriter:
     def fc_hash(model: NNUEModel) -> int:
         # InputSlice hash
         prev_hash = 0xEC42E90D
+        layer_hash = prev_hash
         prev_hash ^= model.L1 * 2
 
         # Fully connected layers
         layers = [
-            model.layer_stacks.l1.linear,
-            model.layer_stacks.l2.linear,
-            model.layer_stacks.output.linear,
+            model.layer_stacks.l1,
+            model.layer_stacks.l2,
+            model.layer_stacks.output,
         ]
         for layer in layers:
             layer_hash = 0xCC03DAE4
-            layer_hash += layer.out_features // model.num_ls_buckets
+            layer_hash += layer.out_features
             layer_hash ^= prev_hash >> 1
             layer_hash ^= (prev_hash << 31) & 0xFFFFFFFF
-            if layer.out_features // model.num_ls_buckets != 1:
+            if layer.out_features != 1:
                 # Clipped ReLU hash
                 layer_hash = (layer_hash + 0x538D24C7) & 0xFFFFFFFF
             prev_hash = layer_hash
@@ -158,7 +159,8 @@ class NNUEWriter:
         self.write_tensor(bias.flatten().numpy(), ft_compression)
         offset = 0
         for f in layer.features:
-            n = f.NUM_REAL_FEATURES
+            feature_size: Any = f.NUM_REAL_FEATURES
+            n = int(feature_size)
             segment = weight[offset : offset + n]
             if f.EXPORT_WEIGHT_DTYPE == torch.int8:
                 self.write_tensor(segment.to(torch.int8).flatten().numpy())
@@ -236,23 +238,51 @@ class NNUEReader:
             self.model.layer_stacks.output,
         ]
         num_ls_buckets = self.model.num_ls_buckets
-        l_w_slices = [
-            torch.chunk(layer.linear.weight.data, num_ls_buckets, dim=0)
-            for layer in layers
-        ]
-        l_b_slices = [
-            torch.chunk(layer.linear.bias.data, num_ls_buckets, dim=0)
-            for layer in layers
-        ]
 
-        for b in range(num_ls_buckets):
-            self.read_int32(fc_hash)  # FC layers hash
-            for layer_idx in range(len(layers)):
-                self.read_fc_layer(
-                    l_w_slices[layer_idx][b],
-                    l_b_slices[layer_idx][b],
-                    is_output=(layer_idx == len(layers) - 1),
-                )
+        if self.model.layer_stacks.use_layer_stacks:
+            l_w_slices = [
+                torch.chunk(layer.linear.weight.data, num_ls_buckets, dim=0)
+                for layer in layers
+            ]
+            l_b_slices = [
+                torch.chunk(layer.linear.bias.data, num_ls_buckets, dim=0)
+                for layer in layers
+            ]
+
+            for b in range(num_ls_buckets):
+                self.read_int32(fc_hash)  # FC layers hash
+                for layer_idx in range(len(layers)):
+                    self.read_fc_layer(
+                        l_w_slices[layer_idx][b],
+                        l_b_slices[layer_idx][b],
+                        is_output=(layer_idx == len(layers) - 1),
+                    )
+        else:
+            layer_weight_sums = [
+                torch.zeros_like(layer.linear.weight.data) for layer in layers
+            ]
+            layer_bias_sums = [
+                torch.zeros_like(layer.linear.bias.data) for layer in layers
+            ]
+
+            for b in range(num_ls_buckets):
+                self.read_int32(fc_hash)  # FC layers hash
+                for layer_idx, layer in enumerate(layers):
+                    weight = torch.empty_like(layer.linear.weight.data)
+                    bias = torch.empty_like(layer.linear.bias.data)
+                    self.read_fc_layer(
+                        weight,
+                        bias,
+                        is_output=(layer_idx == len(layers) - 1),
+                    )
+                    layer_weight_sums[layer_idx].add_(weight)
+                    layer_bias_sums[layer_idx].add_(bias)
+
+            for layer, weight_sum, bias_sum in zip(
+                layers, layer_weight_sums, layer_bias_sums
+            ):
+                layer.linear.weight.data.copy_(weight_sum.div(num_ls_buckets))
+                layer.linear.bias.data.copy_(bias_sum.div(num_ls_buckets))
 
     def read_header(self, feature_hash: int, fc_hash: int) -> None:
         self.read_int32(VERSION)  # version

@@ -360,7 +360,7 @@ def main():
     )
     feature_name = args.nnue_lightning_config.features
 
-    max_epoch = args.max_epochs or 800
+    max_epoch = args.max_epochs
     if args.resume_from_model is None:
         nnue = M.NNUE(
             config=args.nnue_lightning_config,
@@ -447,7 +447,7 @@ def main():
     refresh_rate = max(1, (num_batches_per_epoch + 4) // 5)
     trainer = L.Trainer(
         default_root_dir=logdir,
-        max_epochs=args.max_epochs,
+        max_epochs=max_epoch,
         accelerator="cuda",
         strategy="ddp" if ddp_config.world_size > 1 else "auto",
         devices=devices,

@@ -13,3 +13,5 @@ class LayerStacksConfig:
     """Size of second hidden layer."""
     L3: Annotated[int, tyro.conf.arg(name="l3")] = 32
     """Size of third hidden layer."""
+    layer_stacks: bool = True
+    """Whether to use bucket-specific layer stacks. Disable for a shared dense stack baseline."""
