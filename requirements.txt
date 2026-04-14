@@ -10,5 +10,5 @@ requests
 lightning
 tyro
 ruff
-ranger21
+ranger22 @ git+https://github.com/rgodha24/ranger22
 schedulefree

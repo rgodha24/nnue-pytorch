@@ -16,7 +16,7 @@ dependencies = [
   "lightning",
   "tyro",
   "ruff",
-  "ranger21",
+  "ranger22",
   "schedulefree",
   "cupy-cuda13x<14",
   "apache-tvm-ffi==0.1.9",
@@ -25,6 +25,7 @@ dependencies = [
 
 [tool.uv.sources]
 nnue-loader = { path = "loader", editable = true }
+ranger22 = { git = "https://github.com/rgodha24/ranger22" }
 
 [tool.setuptools]
 py-modules = []

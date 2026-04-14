@@ -5,20 +5,20 @@ from dataclasses import dataclass
 
 
 try:
-    import ranger21
+    import ranger22
 
-    _ranger21_import_error = False
+    _ranger22_import_error = False
 except ImportError:
-    _ranger21_import_error = True
+    _ranger22_import_error = True
 
 
 @dataclass
-class Ranger21Config:
+class Ranger22Config:
     gamma: float = 0.992
     """Multiplicative factor applied to the learning rate after every epoch."""
 
 
-class Ranger21Wrapper:
+class Ranger22Wrapper:
     def __init__(
         self,
         config,
@@ -30,13 +30,13 @@ class Ranger21Wrapper:
         self.gamma = config.gamma
 
     def configure_optimizers(self, train_params):
-        if _ranger21_import_error:
-            raise ImportError("The required ranger21 library is not installed. ")
+        if _ranger22_import_error:
+            raise ImportError("The required ranger22 library is not installed. ")
         if self.num_batches_per_epoch is None:
             raise RuntimeError(
-                "[Ranger21Wrapper] Required parameter for training not set: num_batches_per_epoch"
+                "[Ranger22Wrapper] Required parameter for training not set: num_batches_per_epoch"
             )
-        optimizer = ranger21.Ranger21(
+        optimizer = ranger22.Ranger22(
             train_params,
             lr=1.0,
             betas=(0.9, 0.999),
@@ -59,7 +59,7 @@ class Ranger21Wrapper:
 
         return [optimizer], [scheduler]
 
-    # Ranger21 does not require train/eval flip hooks
+    # Ranger22 does not require train/eval flip hooks
     def on_train_epoch_start(self, pl_module: L.LightningModule):
         pass
 
