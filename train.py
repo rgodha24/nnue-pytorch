@@ -196,6 +196,7 @@ def make_data_loaders(
     val_filenames,
     feature_name: str,
     num_workers,
+    loader_threads,
     batch_size,
     global_batch_size,
     config: data_loader.DataloaderSkipConfig,
@@ -213,6 +214,7 @@ def make_data_loaders(
         train_filenames,
         batch_size,
         num_workers=num_workers,
+        loader_threads=loader_threads,
         config=config,
         ddp_config=ddp_config,
     )
@@ -434,6 +436,7 @@ def main():
         val_datasets,
         input_feature_name,
         actual_workers,
+        args.loader_threads,
         per_rank_batch_size,
         global_batch_size_requested,
         args.dataloader_config,

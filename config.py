@@ -44,6 +44,9 @@ class TrainingConfig:
     num_workers: int = 1
     """Number of worker threads to use for data loading. Currently only works well for binpack."""
 
+    loader_threads: int = -1
+    """Total threads for the Rust data loader. -1 = auto (cpu_count - 1). Set higher to oversuscribe, e.g. 64 on a 32-core machine."""
+
     batch_size: int = 16384
     """Number of positions per batch / per iteration."""
 

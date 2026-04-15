@@ -1,15 +1,17 @@
 import os
-import threading
 import queue
+import threading
 
 import torch
 from torch.utils.data import Dataset
 
 from . import stream
-from .config import DataloaderSkipConfig, DataloaderDDPConfig
+from .config import DataloaderDDPConfig, DataloaderSkipConfig
 
 
 def _recursive_pin(obj):
+    if not torch.cuda.is_available():
+        return obj
     if isinstance(obj, torch.Tensor):
         return obj.pin_memory()
     elif isinstance(obj, dict):
@@ -172,6 +174,7 @@ class RustSparseBatchProvider:
         batch_size,
         cyclic: bool = True,
         num_workers: int = 1,
+        loader_threads: int = -1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
         ddp_config: DataloaderDDPConfig = None,
     ):
@@ -192,21 +195,17 @@ class RustSparseBatchProvider:
         # on `total_threads` if you don't specify both.
         #
         # On slurm/cgroup-restricted hosts, `os.cpu_count()` returns the
-        # host's full CPU count; `sched_getaffinity` returns the cgroup
-        # allocation, which is what we actually have to spend.
-        try:
-            cpu_count = len(os.sched_getaffinity(0))
-        except (AttributeError, OSError):
-            cpu_count = os.cpu_count() or 8
-        # Reserve one thread for the consumer / pin-memory worker.
-        total_threads = max(1, cpu_count - 1)
-
-        # `num_workers` is the legacy C++ knob; if the user pinned it to
-        # something explicit we honour that as a hint, but the Rust loader
-        # uses dedicated decode/encode pools instead of one shared worker
-        # pool, so we don't map it 1:1.
-        if num_workers and num_workers > 1:
-            total_threads = max(total_threads, num_workers)
+        if loader_threads > 0:
+            total_threads = loader_threads
+        else:
+            # host's full CPU count; `sched_getaffinity` returns the cgroup
+            # allocation, which is what we actually have to spend.
+            try:
+                cpu_count = len(os.sched_getaffinity(0))
+            except (AttributeError, OSError):
+                cpu_count = os.cpu_count() or 8
+            # Reserve one thread for the consumer / pin-memory worker.
+            total_threads = max(1, cpu_count - 1)
 
         skip_heavy = (
             config.filtered
@@ -220,11 +219,11 @@ class RustSparseBatchProvider:
         )
 
         if skip_heavy:
-            # ~60/40 decode/encode split. Decoders process ~10x more raw
-            # entries than encoders end up keeping, but feature extraction
-            # for Full_Threats+HalfKAv2_hm is expensive enough that the
-            # encoders also need significant cores.
-            decode_threads = max(1, (total_threads * 5) // 8)
+            # ~90/10 decode/encode split. Decoding is the bottleneck with
+            # high skip rates (e.g. rfs=10 gives 99.5% skip, so decoders
+            # process ~200 positions per 1 kept). Benchmarks on 192-core
+            # machines confirm 90% decode / 10% encode is optimal.
+            decode_threads = max(1, (total_threads * 9) // 10)
         else:
             # Without skipping, encoders dominate.
             decode_threads = max(1, total_threads // 4)
@@ -329,6 +328,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         batch_size,
         cyclic=True,
         num_workers=1,
+        loader_threads: int = -1,
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
         ddp_config: DataloaderDDPConfig = None,
     ):
@@ -338,6 +338,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         self.batch_size = batch_size
         self.cyclic = cyclic
         self.num_workers = num_workers
+        self.loader_threads = loader_threads
         self.config = config
         self.ddp_config = ddp_config
 
@@ -348,6 +349,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
             self.batch_size,
             cyclic=self.cyclic,
             num_workers=self.num_workers,
+            loader_threads=self.loader_threads,
             config=self.config,
             ddp_config=self.ddp_config,
         )

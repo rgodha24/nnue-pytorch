@@ -220,5 +220,5 @@ type FenBatchPtr = ctypes._Pointer[FenBatch]
 try:
     c_lib = CDataLoaderAPI()
 except FileNotFoundError as e:
-    print(e)
-    exit(1)
+    print(f"Warning: {e} (C++ loader unavailable, Rust loader will be used)")
+    c_lib = None
