@@ -163,10 +163,11 @@ def _resolve_thread_config(args: BenchConfig) -> tuple[int, int, int, int]:
         decode = explicit_total - encode
     else:
         if _skip_heavy(args.dataloader_config):
-            decode = max(1, (explicit_total * 9) // 10)
+            # See dataset.py: one encode thread per ~16 cores (ceil division).
+            encode = max(1, (explicit_total + 15) // 16)
         else:
-            decode = max(1, explicit_total // 4)
-        encode = max(1, explicit_total - decode)
+            encode = max(1, explicit_total // 4)
+        decode = max(1, explicit_total - encode)
         explicit_total = decode + encode
 
     if args.slab_count is None:

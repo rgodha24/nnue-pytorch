@@ -219,15 +219,19 @@ class RustSparseBatchProvider:
         )
 
         if skip_heavy:
-            # ~90/10 decode/encode split. Decoding is the bottleneck with
-            # high skip rates (e.g. rfs=10 gives 99.5% skip, so decoders
-            # process ~200 positions per 1 kept). Benchmarks on 192-core
-            # machines confirm 90% decode / 10% encode is optimal.
-            decode_threads = max(1, (total_threads * 9) // 10)
+            # One encode thread per ~16 decode threads (ceil division). At
+            # 99.5% skip rates, decoders are the bottleneck; each encode
+            # thread handles ~1.66M positions/s so 1 thread is sufficient
+            # up to ~16 cores, 2 threads up to ~32 cores, etc. The old 90/10
+            # split over-allocated encode threads (e.g. 4 encode on 32 cores
+            # vs the optimal 2), wasting cores that would be better spent
+            # decoding. Benchmarked on 32-core machine: 30d+2e = 2.52M/s vs
+            # 28d+4e = ~same as 28d+2e because extra encoders are idle.
+            encode_threads = max(1, (total_threads + 15) // 16)
         else:
             # Without skipping, encoders dominate.
-            decode_threads = max(1, total_threads // 4)
-        encode_threads = max(1, total_threads - decode_threads)
+            encode_threads = max(1, total_threads // 4)
+        decode_threads = max(1, total_threads - encode_threads)
 
         # Slab pool: at least one slab per encoder + a few buffered for the
         # consumer. Bigger pools waste memory without throughput gains

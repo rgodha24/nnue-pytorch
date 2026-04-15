@@ -13,3 +13,4 @@ bench
 nnue-data/
 runs/
 *.log
+logs-remote/
