@@ -1,3 +1,5 @@
+import collections
+
 import lightning as L
 import torch
 from torch import Tensor, nn
@@ -56,6 +58,20 @@ class NNUE(L.LightningModule):
             "val_loss_epoch": MeanMetric(),
             "test_loss_epoch": MeanMetric(),
         })
+
+        # ---- H2D overlap plumbing ----
+        # A dedicated CUDA stream for Pinned->Device copies so they can run
+        # concurrently with the previous iteration's compute on the default
+        # stream (Ranger22, FC/FT backward, etc.). Trace analysis on the
+        # 5060 Ti showed the 11.8 ms/step of Memcpy HtoD was being serialized
+        # on the compute stream between the optimizer and the next forward;
+        # moving it to a side stream fully hides it behind Ranger22's 15 ms.
+        #
+        # The CPU batch tuple is also retained for a couple of iterations so
+        # that the Rust loader's underlying CPU buffers are not recycled
+        # while the async copy is still in flight.
+        self._xfer_stream: torch.cuda.Stream | None = None
+        self._pending_cpu_batches: collections.deque = collections.deque(maxlen=3)
 
     # --- setup optimizers and training hooks ---
     def configure_optimizers(self):
@@ -151,7 +167,47 @@ class NNUE(L.LightningModule):
         self.optimizer_wrapper.on_save_checkpoint(self, checkpoint)
 
     def on_train_batch_start(self, batch, batch_idx):
+        # ``transfer_batch_to_device`` launched the H2D copy on ``_xfer_stream``
+        # to overlap with the previous iteration's GPU work. Make the default
+        # compute stream wait for that copy before any kernels read the batch,
+        # and record_stream each tensor so the caching allocator doesn't free
+        # the GPU buffer while compute is still using it.
+        if self._xfer_stream is not None:
+            compute_stream = torch.cuda.current_stream(self._xfer_stream.device)
+            compute_stream.wait_stream(self._xfer_stream)
+            for t in batch:
+                if isinstance(t, torch.Tensor) and t.is_cuda:
+                    t.record_stream(compute_stream)
         self.optimizer_wrapper.on_train_batch_start(self, batch, batch_idx)
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        # Fast path: CPU training or non-cuda device. Fall back to Lightning's
+        # default (which just calls ``.to(device, non_blocking=True)``).
+        if not torch.cuda.is_available() or device.type != "cuda":
+            return super().transfer_batch_to_device(batch, device, dataloader_idx)
+
+        if self._xfer_stream is None:
+            self._xfer_stream = torch.cuda.Stream(device=device)
+
+        xfer_stream = self._xfer_stream
+        with torch.cuda.stream(xfer_stream):
+            if isinstance(batch, (list, tuple)):
+                batch_gpu = type(batch)(
+                    t.to(device, non_blocking=True)
+                    if isinstance(t, torch.Tensor) and t.device.type == "cpu"
+                    else t
+                    for t in batch
+                )
+            elif isinstance(batch, torch.Tensor) and batch.device.type == "cpu":
+                batch_gpu = batch.to(device, non_blocking=True)
+            else:
+                batch_gpu = batch
+
+        # Keep the CPU batch alive for a few iterations so the Rust loader
+        # doesn't recycle the underlying pinned buffer before our async copy
+        # completes. ``maxlen=3`` gives >3x headroom over the ~12 ms copy.
+        self._pending_cpu_batches.append(batch)
+        return batch_gpu
 
     def _log_epoch_end(self, loss_type):
         self.log(
